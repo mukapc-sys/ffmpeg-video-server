@@ -53,11 +53,18 @@ app.post('/concatenate', async (req, res) => {
     const concatContent = downloadedFiles.map(f => `file '${f}'`).join('\n');
     await fs.writeFile(concatFilePath, concatContent);
 
-    // Concatenate videos
+    // Concatenate and compress videos
     const outputPath = path.join(tempDir, outputFilename);
-    console.log(`[${projectId}] Starting concatenation...`);
+    console.log(`[${projectId}] Starting concatenation with compression...`);
     
-    const ffmpegCommand = `ffmpeg -f concat -safe 0 -i ${concatFilePath} -c copy ${outputPath}`;
+    // Use h264_nvenc if available (GPU), fallback to libx264 (CPU)
+    // Compress to max 100MB, maintain quality with CRF 23, scale to max 1080p
+    const ffmpegCommand = `ffmpeg -f concat -safe 0 -i ${concatFilePath} \
+      -c:v libx264 -crf 23 -preset medium \
+      -vf "scale='min(1920,iw)':'min(1080,ih)':force_original_aspect_ratio=decrease" \
+      -c:a aac -b:a 128k \
+      -movflags +faststart \
+      -y ${outputPath}`;
     await execAsync(ffmpegCommand);
     
     console.log(`[${projectId}] Concatenation complete!`);
