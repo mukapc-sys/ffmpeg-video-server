@@ -4,6 +4,7 @@ const { promisify } = require('util');
 const fs = require('fs').promises;
 const path = require('path');
 const fetch = require('node-fetch');
+const FormData = require('form-data');
 
 const execAsync = promisify(exec);
 const app = express();
@@ -18,7 +19,7 @@ app.get('/health', (req, res) => {
 
 // Main concatenation endpoint
 app.post('/concatenate', async (req, res) => {
-  const { videoUrls, outputFilename, projectId } = req.body;
+  const { videoUrls, outputFilename, projectId, supabaseUrl, supabaseKey } = req.body;
 
   if (!videoUrls || videoUrls.length < 2) {
     return res.status(400).json({ error: 'Needs at least 2 video URLs' });
@@ -61,12 +62,29 @@ app.post('/concatenate', async (req, res) => {
     
     console.log(`[${projectId}] Concatenation complete!`);
 
-    // Ler o vídeo e retornar como base64
-    console.log(`[${projectId}] Reading video file...`);
+    // Upload to Supabase Storage
+    console.log(`[${projectId}] Uploading to storage...`);
     const fileBuffer = await fs.readFile(outputPath);
-    const videoBase64 = fileBuffer.toString('base64');
+    
+    const uploadUrl = `${supabaseUrl}/storage/v1/object/videos/${projectId}/${outputFilename}`;
+    const uploadResponse = await fetch(uploadUrl, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${supabaseKey}`,
+        'Content-Type': 'video/mp4'
+      },
+      body: fileBuffer
+    });
 
-    console.log(`[${projectId}] Video converted to base64`);
+    if (!uploadResponse.ok) {
+      const errorText = await uploadResponse.text();
+      throw new Error(`Upload failed: ${uploadResponse.status} - ${errorText}`);
+    }
+
+    console.log(`[${projectId}] Upload complete!`);
+
+    // Get public URL
+    const publicUrl = `${supabaseUrl}/storage/v1/object/public/videos/${projectId}/${outputFilename}`;
 
     // Cleanup
     await fs.rm(tempDir, { recursive: true, force: true });
@@ -74,7 +92,7 @@ app.post('/concatenate', async (req, res) => {
 
     res.json({
       success: true,
-      videoBase64,
+      url: publicUrl,
       filename: outputFilename
     });
 
