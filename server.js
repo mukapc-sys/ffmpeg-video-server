@@ -4,17 +4,12 @@ const { promisify } = require('util');
 const fs = require('fs').promises;
 const path = require('path');
 const fetch = require('node-fetch');
-const { createClient } = require('@supabase/supabase-js');
 
 const execAsync = promisify(exec);
 const app = express();
 app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
-const SUPABASE_URL = process.env.SUPABASE_URL;
-const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
-
-const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 
 // Health check
 app.get('/health', (req, res) => {
@@ -66,25 +61,12 @@ app.post('/concatenate', async (req, res) => {
     
     console.log(`[${projectId}] Concatenation complete!`);
 
-    // Upload to Supabase Storage
-    console.log(`[${projectId}] Uploading to storage...`);
+    // Ler o vídeo e retornar como base64
+    console.log(`[${projectId}] Reading video file...`);
     const fileBuffer = await fs.readFile(outputPath);
-    
-    const { data: uploadData, error: uploadError } = await supabase.storage
-      .from('videos')
-      .upload(`${projectId}/${outputFilename}`, fileBuffer, {
-        contentType: 'video/mp4',
-        upsert: true
-      });
+    const videoBase64 = fileBuffer.toString('base64');
 
-    if (uploadError) throw uploadError;
-
-    // Get public URL
-    const { data: urlData } = supabase.storage
-      .from('videos')
-      .getPublicUrl(`${projectId}/${outputFilename}`);
-
-    console.log(`[${projectId}] Upload complete!`);
+    console.log(`[${projectId}] Video converted to base64`);
 
     // Cleanup
     await fs.rm(tempDir, { recursive: true, force: true });
@@ -92,7 +74,7 @@ app.post('/concatenate', async (req, res) => {
 
     res.json({
       success: true,
-      url: urlData.publicUrl,
+      videoBase64,
       filename: outputFilename
     });
 
