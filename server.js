@@ -191,8 +191,13 @@ async function fastCopyVideo(inputFile, outputFile, projectId, videoIndex) {
     console.log(`[${projectId}] ⚡ FAST-PATH: Copiando streams do vídeo ${videoIndex} (sem re-encode)...`);
     const startTime = Date.now();
     
-    // Stream copy: copia dados binários sem re-processar
-    const copyCommand = `ffmpeg -i "${inputFile}" -c copy -movflags +faststart -y "${outputFile}"`;
+    // Stream copy: copia dados binários sem re-processar com correção de timestamps
+    const copyCommand = `ffmpeg -i "${inputFile}" \
+      -c copy \
+      -movflags +faststart \
+      -fflags +genpts \
+      -avoid_negative_ts make_zero \
+      -y "${outputFile}"`;
     
     await execAsync(copyCommand, {
       maxBuffer: 100 * 1024 * 1024,
@@ -248,15 +253,18 @@ async function normalizeVideoWithRetries(inputFile, outputFile, targetDimensions
     try {
       const startTime = Date.now();
       
-      // Comando FFmpeg normalizado com especificações robustas
+      // Comando FFmpeg normalizado com correção de sincronização de áudio
       const normalizeCommand = `ffmpeg -i "${inputFile}" \
         -vf "scale=${targetDimensions.width}:${targetDimensions.height}:force_original_aspect_ratio=decrease,pad=${targetDimensions.width}:${targetDimensions.height}:(ow-iw)/2:(oh-ih)/2:black,setsar=1,fps=30${attempt.extraFilters}" \
         -c:v libx264 -preset ${attempt.preset} -crf ${attempt.crf} \
         -c:a aac -b:a 128k -ar 48000 \
+        -af "aresample=async=1000:min_hard_comp=0.100000:first_pts=0" \
         -movflags +faststart \
         -max_muxing_queue_size 1024 \
         -vsync cfr \
         -async 1 \
+        -fflags +genpts+igndts \
+        -avoid_negative_ts make_zero \
         -y "${outputFile}"`;
       
       const { stdout, stderr } = await execAsync(normalizeCommand, {
