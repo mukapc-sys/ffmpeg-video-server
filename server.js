@@ -565,6 +565,7 @@ app.post('/concatenate', authenticateApiKey, async (req, res) => {
       // ============================================
       // COMPRESSÃO ITERATIVA ATÉ < 49MB (SOMENTE VÍDEO)
       // ============================================
+      const outputPath = path.join(tempDir, outputFilename); // Declarar ANTES do if
       const MAX_SIZE_MB = 49;
       const MAX_CRF = 35; // CRF máximo antes de desistir
       let currentSizeMB = videoOnlyStats.size / 1024 / 1024;
@@ -683,7 +684,6 @@ app.post('/concatenate', authenticateApiKey, async (req, res) => {
       // ============================================
       console.log(`[${projectId}] 🎵 ETAPA 4: Adicionando áudio original concatenado ao vídeo final...`);
       
-      const outputPath = path.join(tempDir, outputFilename);
       const addAudioCommand = `ffmpeg -i "${videoOnlyPath}" -i "${finalAudioPath}" \
         -c:v copy \
         -c:a copy \
