@@ -320,7 +320,7 @@ async function generateR2SignedUrl(endpoint, bucket, key, accessKeyId, secretAcc
     'X-Amz-Credential': credential,
     'X-Amz-Date': amzDate,
     'X-Amz-Expires': '3600',
-    'X-Amz-SignedHeaders': 'content-type;host',
+    'X-Amz-SignedHeaders': 'host',
   });
 
   url.search = params.toString();
@@ -329,10 +329,9 @@ async function generateR2SignedUrl(endpoint, bucket, key, accessKeyId, secretAcc
     method,
     `/${bucket}/${key}`,
     params.toString(),
-    `content-type:video/mp4`,
     `host:${url.host}`,
     '',
-    'content-type;host',
+    'host',
     'UNSIGNED-PAYLOAD'
   ].join('\n');
 
@@ -353,7 +352,7 @@ async function generateR2SignedUrl(endpoint, bucket, key, accessKeyId, secretAcc
 
 // Main concatenation endpoint (protected)
 app.post("/concatenate", authenticateApiKey, async (req, res) => {
-  const { videoUrls, outputFilename, projectId, format, supabaseUrl, supabaseKey } = req.body;
+  const { videoUrls, outputFilename, projectId, format, supabaseUrl, supabaseKey, r2AccountId, r2AccessKeyId, r2SecretAccessKey } = req.body;
 
   console.log(`[${projectId}] 📥 Received request - Format: ${format}, Videos: ${videoUrls?.length}`);
 
@@ -734,13 +733,9 @@ app.post("/concatenate", authenticateApiKey, async (req, res) => {
 
     const storagePath = req.body.storagePath || `${projectId}/${outputFilename}`;
     
-    // Get R2 credentials from environment
-    const r2AccountId = process.env.R2_ACCOUNT_ID;
-    const r2AccessKeyId = process.env.R2_ACCESS_KEY_ID;
-    const r2SecretAccessKey = process.env.R2_SECRET_ACCESS_KEY;
-
+    // R2 credentials should come from request payload (passed from edge function)
     if (!r2AccountId || !r2AccessKeyId || !r2SecretAccessKey) {
-      throw new Error('R2 credentials not configured in environment');
+      throw new Error('R2 credentials not provided in request');
     }
 
     const bucket = 'video-parts-upload';
