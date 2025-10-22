@@ -320,7 +320,7 @@ async function generateR2SignedUrl(endpoint, bucket, key, accessKeyId, secretAcc
     'X-Amz-Credential': credential,
     'X-Amz-Date': amzDate,
     'X-Amz-Expires': '3600',
-    'X-Amz-SignedHeaders': 'host',
+    'X-Amz-SignedHeaders': 'content-type;host',
   });
 
   url.search = params.toString();
@@ -329,9 +329,10 @@ async function generateR2SignedUrl(endpoint, bucket, key, accessKeyId, secretAcc
     method,
     `/${bucket}/${key}`,
     params.toString(),
+    `content-type:video/mp4`,
     `host:${url.host}`,
     '',
-    'host',
+    'content-type;host',
     'UNSIGNED-PAYLOAD'
   ].join('\n');
 
