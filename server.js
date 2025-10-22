@@ -222,7 +222,7 @@ async function fastCopyVideo(inputFile, outputFile, projectId, videoIndex) {
 /**
  * Normalize video with 3-level fallback strategy
  * ⬅️ AGORA normaliza VÍDEO + ÁUDIO juntos, com sync garantido
- * NOTE: removi 'aresample=async=1' daqui para evitar stretch/pitch issues.
+ * ✅ CORRIGIDO: Removido aresample=async=1 que causava desincronização
  */
 async function normalizeVideoWithRetries(inputFile, outputFile, targetDimensions, projectId, videoIndex) {
   const attempts = [
@@ -239,11 +239,12 @@ async function normalizeVideoWithRetries(inputFile, outputFile, targetDimensions
       const startTime = Date.now();
 
       // 🔧 Flags robustas + áudio junto com vídeo + sync perfeito para vídeos comprimidos
+      // ✅ Removido aresample=async=1 que causava stretch/pitch issues
       const normalizeCommand = `ffmpeg -hide_banner -loglevel error \
         -err_detect ignore_err -fflags +genpts -analyzeduration 100M -probesize 100M \
         -i "${inputFile}" \
         -vf "scale=${targetDimensions.width}:${targetDimensions.height}:force_original_aspect_ratio=decrease,pad=${targetDimensions.width}:${targetDimensions.height}:(ow-iw)/2:(oh-ih)/2:black,setsar=1,setpts=PTS-STARTPTS${attempt.extraFilters}" \
-        -af "aresample=async=1:first_pts=0,asetpts=PTS-STARTPTS" \
+        -af "asetpts=PTS-STARTPTS" \
         -r 30 \
         -c:v libx264 -preset ${attempt.preset} -crf ${attempt.crf} \
         -maxrate 1.5M -bufsize 3M \
