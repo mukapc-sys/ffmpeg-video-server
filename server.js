@@ -114,8 +114,8 @@ async function validateVideoFile(filepath, projectId, videoIndex) {
       throw new Error(`Arquivo muito pequeno (${stats.size} bytes)`);
     }
     
-    // ffprobe para validar estrutura do vídeo
-    const probeCmd = `ffprobe -v error -select_streams v:0 -count_packets -show_entries stream=codec_name,width,height,r_frame_rate,duration,nb_read_packets -of json "${filepath}"`;
+    // ffprobe para validar estrutura do vídeo (⬅️ ADICIONADO analyzeduration/probesize)
+    const probeCmd = `ffprobe -v error -analyzeduration 100M -probesize 100M -select_streams v:0 -count_packets -show_entries stream=codec_name,width,height,r_frame_rate,duration,nb_read_packets -of json "${filepath}"`;
     const { stdout } = await execAsync(probeCmd, { timeout: 30000 });
     const probeData = JSON.parse(stdout);
     
@@ -161,11 +161,11 @@ async function validateVideoFile(filepath, projectId, videoIndex) {
 /**
  * Decide if video needs normalization based on specs
  * Returns TRUE if re-encode is needed, FALSE if can use fast-path
+ * (mantive sua lógica; se quiser, podemos forçar sempre true)
  */
 function shouldNormalizeVideo(validationData, targetDimensions) {
   const { codec, width, height, fps } = validationData;
   
-  // Condições para PULAR normalização (usar stream copy):
   const isCorrectCodec = codec === 'h264';
   const isCorrectWidth = width === targetDimensions.width;
   const isCorrectHeight = height === targetDimensions.height;
@@ -175,11 +175,11 @@ function shouldNormalizeVideo(validationData, targetDimensions) {
   
   if (canSkipNormalization) {
     console.log(`✅ Vídeo JÁ está no formato ideal (${codec}, ${width}x${height}, ${fps}fps) - PULANDO re-encode`);
-    return false; // Não precisa normalizar
+    return false;
   }
   
   console.log(`⚠️ Vídeo precisa de normalização: codec=${codec}, dimensões=${width}x${height}, fps=${fps}`);
-  return true; // Precisa normalizar
+  return true;
 }
 
 /**
@@ -191,7 +191,6 @@ async function fastCopyVideo(inputFile, outputFile, projectId, videoIndex) {
     console.log(`[${projectId}] ⚡ FAST-PATH: Copiando streams do vídeo ${videoIndex} (sem re-encode)...`);
     const startTime = Date.now();
     
-    // Stream copy: copia dados binários sem re-processar com correção de timestamps
     const copyCommand = `ffmpeg -i "${inputFile}" \
       -c copy \
       -movflags +faststart \
@@ -201,10 +200,9 @@ async function fastCopyVideo(inputFile, outputFile, projectId, videoIndex) {
     
     await execAsync(copyCommand, {
       maxBuffer: 100 * 1024 * 1024,
-      timeout: 60000 // 1 minuto (muito mais rápido que re-encode)
+      timeout: 60000
     });
     
-    // Validar arquivo de saída
     const stats = await fs.stat(outputFile);
     if (stats.size < 1000) {
       throw new Error(`Arquivo copiado muito pequeno (${stats.size} bytes)`);
@@ -217,33 +215,19 @@ async function fastCopyVideo(inputFile, outputFile, projectId, videoIndex) {
     
   } catch (error) {
     console.error(`[${projectId}] ❌ Fast-path falhou (não é fatal):`, error.message);
-    throw error; // Permite fallback para normalização completa
+    throw error;
   }
 }
 
 /**
  * Normalize video with 3-level fallback strategy
+ * ⬅️ AGORA normaliza VÍDEO + ÁUDIO juntos, com sync garantido
  */
 async function normalizeVideoWithRetries(inputFile, outputFile, targetDimensions, projectId, videoIndex) {
   const attempts = [
-    {
-      name: 'Normalização Rápida',
-      preset: 'fast',
-      crf: 23,
-      extraFilters: ''
-    },
-    {
-      name: 'Normalização Robusta',
-      preset: 'medium',
-      crf: 25,
-      extraFilters: ',format=yuv420p'
-    },
-    {
-      name: 'Re-encode Total Forçado',
-      preset: 'slow',
-      crf: 28,
-      extraFilters: ',format=yuv420p,setpts=PTS-STARTPTS'
-    }
+    { name: 'Normalização Rápida',  preset: 'fast',   crf: 23, extraFilters: '' },
+    { name: 'Normalização Robusta', preset: 'medium', crf: 25, extraFilters: ',format=yuv420p' },
+    { name: 'Re-encode Total Forçado', preset: 'slow', crf: 28, extraFilters: ',format=yuv420p,setpts=PTS-STARTPTS' }
   ];
   
   for (let attemptIndex = 0; attemptIndex < attempts.length; attemptIndex++) {
@@ -253,69 +237,51 @@ async function normalizeVideoWithRetries(inputFile, outputFile, targetDimensions
     try {
       const startTime = Date.now();
       
-      // Comando FFmpeg normalizado APENAS PARA VÍDEO (sem áudio)
-      // - Processa SOMENTE o stream de vídeo (-an remove áudio)
-      // - Áudio será adicionado separadamente depois
-      console.log(`[${projectId}] 🔧 Normalizando APENAS vídeo ${videoIndex} (sem áudio) com parâmetros:`, {
-        preset: attempt.preset,
-        crf: attempt.crf,
-        targetWidth: targetDimensions.width,
-        targetHeight: targetDimensions.height
-      });
-      
-      const normalizeCommand = `ffmpeg -i "${inputFile}" \
+      // 🔧 Flags robustas + áudio junto com vídeo (SEM -an)
+      const normalizeCommand = `ffmpeg -hide_banner -loglevel error \
+        -err_detect ignore_err -fflags +genpts -analyzeduration 100M -probesize 100M \
+        -i "${inputFile}" \
         -vf "scale=${targetDimensions.width}:${targetDimensions.height}:force_original_aspect_ratio=decrease,pad=${targetDimensions.width}:${targetDimensions.height}:(ow-iw)/2:(oh-ih)/2:black,setsar=1${attempt.extraFilters}" \
         -r 30 \
         -c:v libx264 -preset ${attempt.preset} -crf ${attempt.crf} \
         -maxrate 1.5M -bufsize 3M \
-        -an \
+        -c:a aac -b:a 128k -ar 48000 -ac 2 \
+        -af "aresample=async=1:first_pts=0" \
+        -vsync cfr -async 1 -avoid_negative_ts make_zero -xerror \
         -movflags +faststart \
-        -max_muxing_queue_size 1024 \
+        -max_muxing_queue_size 2048 \
         -y "${outputFile}"`;
       
       const { stdout, stderr } = await execAsync(normalizeCommand, {
         maxBuffer: 100 * 1024 * 1024,
-        timeout: 600000 // 10 minutos
+        timeout: 900000
       });
       
-      console.log(`[${projectId}] 📊 Normalização stdout (primeiras 500 chars):`, stdout.substring(0, 500));
       if (stderr) {
-        console.log(`[${projectId}] ⚠️ Normalização stderr (primeiras 1000 chars):`, stderr.substring(0, 1000));
+        console.log(`[${projectId}] ⚙️ Normalização (stderr parcial):`, stderr.substring(0, 600));
       }
       
-      // Validar arquivo de saída
       const stats = await fs.stat(outputFile);
       if (stats.size < 1000) {
         throw new Error(`Arquivo normalizado muito pequeno (${stats.size} bytes)`);
       }
       
       const duration = ((Date.now() - startTime) / 1000).toFixed(2);
-      console.log(`[${projectId}] ✅ Vídeo ${videoIndex} normalizado com sucesso em ${duration}s (${(stats.size / 1024 / 1024).toFixed(2)} MB)`);
+      console.log(`[${projectId}] ✅ Vídeo ${videoIndex} normalizado com sucesso em ${duration}s (${(stats.size / 1024 / 1024).toFixed(2)} MB) via ${attempt.name}`);
       
       return { success: true, method: attempt.name };
       
     } catch (error) {
       console.error(`[${projectId}] ❌ ${attempt.name} falhou:`, error.message);
+      if (error.stderr) console.error(`[${projectId}] 📋 FFmpeg stderr completo:`, error.stderr.substring(0, 1000));
+      if (error.code) console.error(`[${projectId}] 💥 Exit code:`, error.code);
+      if (error.signal) console.error(`[${projectId}] ⚡ Signal:`, error.signal);
       
-      // Log detalhado do erro para debug
-      if (error.stderr) {
-        console.error(`[${projectId}] 📋 FFmpeg stderr completo:`, error.stderr);
-      }
-      if (error.code) {
-        console.error(`[${projectId}] 💥 Exit code:`, error.code);
-      }
-      if (error.signal) {
-        console.error(`[${projectId}] ⚡ Signal:`, error.signal);
-      }
-      
-      // Se não é a última tentativa, continua para próxima
       if (attemptIndex < attempts.length - 1) {
         console.log(`[${projectId}] ⚠️ Tentando próximo método...`);
         continue;
       }
-      
-      // Se chegou aqui, todas as 3 tentativas falharam
-      throw new Error(`Todas as 3 tentativas de normalização falharam para vídeo ${videoIndex}. Último erro: ${error.message}. Stderr: ${error.stderr || 'N/A'}`);
+      throw new Error(`Todas as 3 tentativas de normalização falharam para vídeo ${videoIndex}. Último erro: ${error.message}.`);
     }
   }
 }
@@ -417,48 +383,45 @@ app.post('/concatenate', authenticateApiKey, async (req, res) => {
     console.log(`[${projectId}] ✅ Todos os ${downloadedFiles.length} vídeos passaram na validação`);
 
     // ============================================
-    // ETAPA 1.5: EXTRAIR E NORMALIZAR ÁUDIOS PARA AAC
+    // ETAPA 1.5: EXTRAIR ÁUDIOS ORIGINAIS (AGORA RE-ENCODADOS EM AAC 48 kHz)
     // ============================================
-    console.log(`[${projectId}] 🎵 ETAPA 1.5: Extraindo e normalizando áudios para AAC...`);
+    console.log(`[${projectId}] 🎵 ETAPA 1.5: Extraindo áudios (com re-encode para AAC e sync)...`);
     
     const extractedAudios = [];
     for (let i = 0; i < downloadedFiles.length; i++) {
       const audioFile = path.join(tempDir, `audio-${i}.aac`);
-      // Normalizar para AAC 128k para garantir compatibilidade
-      const extractCommand = `ffmpeg -i "${downloadedFiles[i]}" -vn -c:a aac -b:a 128k -ar 48000 -ac 2 -y "${audioFile}"`;
+      // ⬇️ Troquei -c:a copy por encode + resample + sync
+      const extractCommand = `ffmpeg -hide_banner -loglevel error -i "${downloadedFiles[i]}" -vn -c:a aac -b:a 128k -ar 48000 -ac 2 -af "aresample=async=1:first_pts=0" -y "${audioFile}"`;
       
       try {
-        await execAsync(extractCommand, { timeout: 60000 });
-        const audioStats = await fs.stat(audioFile);
+        await execAsync(extractCommand, { timeout: 120000 });
         extractedAudios.push(audioFile);
-        console.log(`[${projectId}] ✅ Áudio ${i + 1} extraído e normalizado (${(audioStats.size / 1024).toFixed(2)} KB)`);
+        console.log(`[${projectId}] ✅ Áudio ${i + 1} extraído e normalizado (AAC 48kHz)`);
       } catch (extractError) {
         console.error(`[${projectId}] ❌ Erro ao extrair áudio ${i + 1}:`, extractError.message);
         throw new Error(`Falha ao extrair áudio do vídeo ${i + 1}`);
       }
     }
     
-    // Concatenar áudios usando codec copy
+    // Concatenar áudios (agora todos AAC 48kHz iguais)
     const audioConcatFile = path.join(tempDir, 'audio-concat.txt');
     const audioConcatContent = extractedAudios.map(f => `file '${f}'`).join('\n');
     await fs.writeFile(audioConcatFile, audioConcatContent);
     
-    console.log(`[${projectId}] 📝 Lista de áudios para concatenação:\n${audioConcatContent}`);
-    
     const finalAudioPath = path.join(tempDir, 'final-audio.aac');
-    const audioConcatCommand = `ffmpeg -f concat -safe 0 -i "${audioConcatFile}" -c copy -y "${finalAudioPath}"`;
+    const audioConcatCommand = `ffmpeg -hide_banner -loglevel error -f concat -safe 0 -i "${audioConcatFile}" -c copy -y "${finalAudioPath}"`;
     
     try {
-      await execAsync(audioConcatCommand, { timeout: 120000 });
+      await execAsync(audioConcatCommand, { timeout: 180000 });
       const audioStats = await fs.stat(finalAudioPath);
-      console.log(`[${projectId}] ✅ Áudios concatenados (${(audioStats.size / 1024 / 1024).toFixed(2)} MB, ${extractedAudios.length} arquivos)`);
+      console.log(`[${projectId}] ✅ Áudios concatenados (${(audioStats.size / 1024 / 1024).toFixed(2)} MB, AAC 48kHz)`);
     } catch (concatError) {
       console.error(`[${projectId}] ❌ Erro ao concatenar áudios:`, concatError.message);
       throw new Error('Falha ao concatenar áudios');
     }
 
     // ============================================
-    // ETAPA 2: NORMALIZAÇÃO INTELIGENTE (SOMENTE VÍDEO)
+    // ETAPA 2: NORMALIZAÇÃO INTELIGENTE (AGORA VÍDEO + ÁUDIO, MAS A GENTE SÓ USA O VÍDEO DEPOIS)
     // ============================================
     console.log(`[${projectId}] 🔄 ETAPA 2: Verificando necessidade de normalização...`);
     
@@ -471,11 +434,9 @@ app.post('/concatenate', authenticateApiKey, async (req, res) => {
       
       console.log(`[${projectId}] 📹 Vídeo ${i + 1}/${downloadedFiles.length}: ${validation.codec} ${validation.width}x${validation.height} ${validation.fps}fps`);
       
-      // 🔑 DECISÃO INTELIGENTE: Normalizar ou não?
       const needsNormalization = shouldNormalizeVideo(validation, targetDimensions);
       
       if (needsNormalization) {
-        // ⚙️ Caminho normal: Re-encode completo (vídeo não está no formato ideal)
         console.log(`[${projectId}] 🔄 Normalizando vídeo ${i + 1} (re-encode necessário)...`);
         
         const result = await normalizeVideoWithRetries(
@@ -490,7 +451,6 @@ app.post('/concatenate', authenticateApiKey, async (req, res) => {
         console.log(`[${projectId}] ✅ Vídeo ${i + 1} normalizado via: ${result.method}`);
         
       } else {
-        // ⚡ Fast-path: Vídeo JÁ está perfeito, apenas copia streams
         console.log(`[${projectId}] ⚡ Vídeo ${i + 1} JÁ está perfeito, usando fast-path...`);
         
         try {
@@ -505,7 +465,6 @@ app.post('/concatenate', authenticateApiKey, async (req, res) => {
           console.log(`[${projectId}] ✅ ${result.method} - 10x mais rápido que re-encode!`);
           
         } catch (fastPathError) {
-          // 🛡️ FALLBACK AUTOMÁTICO: Se fast-path falhar, usa re-encode
           console.log(`[${projectId}] ⚠️ Fast-path falhou, usando re-encode como fallback...`);
           
           const result = await normalizeVideoWithRetries(
@@ -535,13 +494,12 @@ app.post('/concatenate', authenticateApiKey, async (req, res) => {
     // ETAPA 3: CONCATENAÇÃO RÁPIDA (APENAS VÍDEOS, SEM ÁUDIO)
     // ============================================
     const videoOnlyPath = path.join(tempDir, `video-only-${outputFilename}`);
-    const outputPath = path.join(tempDir, outputFilename); // DECLARAR AQUI para estar disponível em todo o escopo
+    const outputPath = path.join(tempDir, outputFilename); // Declarado aqui para escopo
     console.log(`[${projectId}] 🎬 ETAPA 3: Concatenando ${normalizedFiles.length} vídeos normalizados (sem áudio)...`);
     console.log(`[${projectId}] Video-only output will be: ${videoOnlyPath}`);
     
-    // Como TODOS os vídeos foram normalizados, usar sempre concat rápido
     console.log(`[${projectId}] Using fast concat (codec copy - vídeos já normalizados, sem áudio)`);
-    const ffmpegCommand = `ffmpeg -f concat -safe 0 -i "${concatFilePath}" \
+    const ffmpegCommand = `ffmpeg -hide_banner -loglevel error -f concat -safe 0 -i "${concatFilePath}" \
       -c copy \
       -movflags +faststart \
       -y "${videoOnlyPath}"`;
@@ -549,12 +507,11 @@ app.post('/concatenate', authenticateApiKey, async (req, res) => {
     try {
       const concatStartTime = Date.now();
       const { stdout, stderr } = await execAsync(ffmpegCommand, {
-        timeout: 600000 // 10 minutos
+        timeout: 600000
       });
       
       const concatTime = ((Date.now() - concatStartTime) / 1000).toFixed(2);
       
-      // Verify output file
       let videoOnlyStats = await fs.stat(videoOnlyPath);
       console.log(`[${projectId}] ✅ Video concatenation complete in ${concatTime}s!`);
       console.log(`[${projectId}] Video-only file size: ${(videoOnlyStats.size / 1024 / 1024).toFixed(2)} MB`);
@@ -568,14 +525,14 @@ app.post('/concatenate', authenticateApiKey, async (req, res) => {
       }
 
       // ============================================
-      // COMPRESSÃO ITERATIVA ATÉ < 49MB (SOMENTE VÍDEO)
+      // COMPRESSÃO ITERATIVA ATÉ < 49MB (SOMENTE VÍDEO) – mantido
       // ============================================
       const MAX_SIZE_MB = 49;
-      const MAX_CRF = 35; // CRF máximo antes de desistir
+      const MAX_CRF = 35;
       let currentSizeMB = videoOnlyStats.size / 1024 / 1024;
-      let currentCrf = 23; // CRF inicial
+      let currentCrf = 23;
       let compressionAttempt = 0;
-      const MAX_ATTEMPTS = 4; // Máximo de tentativas de compressão
+      const MAX_ATTEMPTS = 4;
       
       if (currentSizeMB > MAX_SIZE_MB) {
         console.log(`[${projectId}] ⚠️ Vídeo muito grande (${currentSizeMB.toFixed(2)} MB). Iniciando compressão iterativa (somente vídeo)...`);
@@ -586,22 +543,19 @@ app.post('/concatenate', authenticateApiKey, async (req, res) => {
         while (currentSizeMB > MAX_SIZE_MB && compressionAttempt < MAX_ATTEMPTS && currentCrf <= MAX_CRF) {
           compressionAttempt++;
           
-          // Calcular CRF baseado no quanto precisa comprimir
           const compressionRatio = currentSizeMB / MAX_SIZE_MB;
           
           if (compressionAttempt === 1) {
-            // Primeira tentativa: CRF baseado no tamanho inicial
             if (compressionRatio > 3) {
-              currentCrf = 32; // Enorme - compressão muito agressiva
+              currentCrf = 32;
             } else if (compressionRatio > 2) {
-              currentCrf = 30; // Muito grande - compressão agressiva
+              currentCrf = 30;
             } else if (compressionRatio > 1.5) {
-              currentCrf = 28; // Grande - compressão alta
+              currentCrf = 28;
             } else {
-              currentCrf = 25; // Levemente grande - compressão moderada
+              currentCrf = 25;
             }
           } else {
-            // Tentativas subsequentes: aumentar CRF gradualmente
             currentCrf = Math.min(currentCrf + 3, MAX_CRF);
           }
           
@@ -609,7 +563,6 @@ app.post('/concatenate', authenticateApiKey, async (req, res) => {
           
           const compressedPath = path.join(tempDir, `compressed_${compressionAttempt}_${outputFilename}`);
           
-          // Ajustar bitrate baseado no CRF
           let maxrate = '3M';
           let bufsize = '6M';
           if (currentCrf >= 30) {
@@ -621,7 +574,7 @@ app.post('/concatenate', authenticateApiKey, async (req, res) => {
             bufsize = '3M';
           }
           
-          const compressCommand = `ffmpeg -i "${workingPath}" \
+          const compressCommand = `ffmpeg -hide_banner -loglevel error -i "${workingPath}" \
             -c:v libx264 -preset medium -crf ${currentCrf} \
             -maxrate ${maxrate} -bufsize ${bufsize} \
             -an \
@@ -631,7 +584,7 @@ app.post('/concatenate', authenticateApiKey, async (req, res) => {
           try {
             await execAsync(compressCommand, {
               maxBuffer: 100 * 1024 * 1024,
-              timeout: 900000 // 15 minutos
+              timeout: 900000
             });
             
             const compressedStats = await fs.stat(compressedPath);
@@ -640,7 +593,6 @@ app.post('/concatenate', authenticateApiKey, async (req, res) => {
             
             console.log(`[${projectId}] Resultado tentativa ${compressionAttempt}: ${currentSizeMB.toFixed(2)} MB → ${newSizeMB.toFixed(2)} MB (${reductionPercent}% redução total)`);
             
-            // Deletar o arquivo anterior se não for o original
             if (workingPath !== videoOnlyPath) {
               await fs.unlink(workingPath);
             }
@@ -648,7 +600,6 @@ app.post('/concatenate', authenticateApiKey, async (req, res) => {
             workingPath = compressedPath;
             currentSizeMB = newSizeMB;
             
-            // Se atingiu o objetivo, sair do loop
             if (currentSizeMB <= MAX_SIZE_MB) {
               console.log(`[${projectId}] ✅ Objetivo alcançado! Vídeo (sem áudio) está em ${currentSizeMB.toFixed(2)} MB`);
               break;
@@ -656,7 +607,6 @@ app.post('/concatenate', authenticateApiKey, async (req, res) => {
             
           } catch (compressError) {
             console.error(`[${projectId}] Erro na tentativa ${compressionAttempt}:`, compressError.message);
-            // Se falhar, tentar próximo CRF
             continue;
           }
         }
@@ -668,12 +618,10 @@ app.post('/concatenate', authenticateApiKey, async (req, res) => {
         console.log(`[${projectId}] ✅ Compressão do vídeo completa em ${totalCompressTime}s após ${compressionAttempt} tentativa(s)`);
         console.log(`[${projectId}] ${originalSizeMB.toFixed(2)} MB → ${currentSizeMB.toFixed(2)} MB (${finalReduction}% redução)`);
         
-        // Verificar se ainda excede o limite
         if (currentSizeMB > MAX_SIZE_MB) {
           console.error(`[${projectId}] ⚠️ AVISO: Vídeo (sem áudio) ainda excede ${MAX_SIZE_MB}MB após ${compressionAttempt} tentativas! (${currentSizeMB.toFixed(2)} MB)`);
         }
         
-        // Substituir arquivo original pelo comprimido final
         if (workingPath !== videoOnlyPath) {
           await fs.unlink(videoOnlyPath);
           await fs.rename(workingPath, videoOnlyPath);
@@ -684,13 +632,14 @@ app.post('/concatenate', authenticateApiKey, async (req, res) => {
       }
 
       // ============================================
-      // ETAPA 4: ADICIONAR ÁUDIO ORIGINAL AO VÍDEO FINAL
+      // ETAPA 4: ADICIONAR ÁUDIO CONCATENADO AO VÍDEO FINAL (re-encode AAC + sync)
       // ============================================
       console.log(`[${projectId}] 🎵 ETAPA 4: Adicionando áudio original concatenado ao vídeo final...`);
       
-      const addAudioCommand = `ffmpeg -i "${videoOnlyPath}" -i "${finalAudioPath}" \
+      const addAudioCommand = `ffmpeg -hide_banner -loglevel error -i "${videoOnlyPath}" -i "${finalAudioPath}" \
         -c:v copy \
-        -c:a copy \
+        -c:a aac -b:a 128k -ar 48000 -ac 2 \
+        -af "aresample=async=1:first_pts=0" \
         -shortest \
         -movflags +faststart \
         -y "${outputPath}"`;
@@ -714,11 +663,9 @@ app.post('/concatenate', authenticateApiKey, async (req, res) => {
     console.log(`[${projectId}] Uploading to storage...`);
     const fileBuffer = await fs.readFile(outputPath);
     
-    // Use custom storagePath if provided (for batch organization), otherwise use default
     const storagePath = req.body.storagePath || `${projectId}/${outputFilename}`;
     const uploadUrl = `${supabaseUrl}/storage/v1/object/videos/${storagePath}`;
     
-    // Try to delete if exists (for retry scenarios) - with proper error handling
     try {
       const deleteUrl = `${supabaseUrl}/storage/v1/object/videos/${storagePath}`;
       const deleteResponse = await fetch(deleteUrl, {
@@ -734,13 +681,11 @@ app.post('/concatenate', authenticateApiKey, async (req, res) => {
       } else {
         const deleteError = await deleteResponse.text();
         console.warn(`[${projectId}] Delete warning (${deleteResponse.status}): ${deleteError}`);
-        // Continuar mesmo com warning - o upsert deve resolver
       }
     } catch (deleteError) {
       console.warn(`[${projectId}] Delete exception (continuing): ${deleteError.message}`);
     }
     
-    // Upload with upsert behavior
     const uploadResponse = await fetch(uploadUrl, {
       method: 'POST',
       headers: {
@@ -756,7 +701,6 @@ app.post('/concatenate', authenticateApiKey, async (req, res) => {
       const errorText = await uploadResponse.text();
       console.error(`[${projectId}] Upload failed (${uploadResponse.status}):`, errorText);
       
-      // Se for erro 409 (duplicate), tentar novamente com timestamp único
       if (uploadResponse.status === 409) {
         throw new Error(`Upload failed: ${uploadResponse.status} - Duplicate file. Retry with unique name.`);
       }
@@ -766,10 +710,8 @@ app.post('/concatenate', authenticateApiKey, async (req, res) => {
 
     console.log(`[${projectId}] Upload complete!`);
 
-    // Get public URL using the actual storage path
     const publicUrl = `${supabaseUrl}/storage/v1/object/public/videos/${storagePath}`;
 
-    // Cleanup agressivo - remover diretório temporário
     try {
       await fs.rm(tempDir, { recursive: true, force: true });
       console.log(`[${projectId}] Cleanup complete`);
@@ -777,7 +719,6 @@ app.post('/concatenate', authenticateApiKey, async (req, res) => {
       console.error(`[${projectId}] Cleanup warning:`, cleanupError.message);
     }
 
-    // Forçar garbage collection se disponível
     if (global.gc) {
       global.gc();
       console.log(`[${projectId}] Garbage collection triggered`);
@@ -792,7 +733,6 @@ app.post('/concatenate', authenticateApiKey, async (req, res) => {
   } catch (error) {
     console.error(`[${projectId}] Error:`, error);
     
-    // Cleanup on error - CRÍTICO para não deixar lixo
     try {
       if (tempDir) {
         await fs.rm(tempDir, { recursive: true, force: true });
@@ -802,13 +742,10 @@ app.post('/concatenate', authenticateApiKey, async (req, res) => {
       console.error(`[${projectId}] Cleanup error:`, cleanupError.message);
     }
 
-    // Tentar limpar processos FFmpeg pendurados
     try {
       await execAsync('pkill -9 ffmpeg || true');
       console.log(`[${projectId}] Killed hanging FFmpeg processes`);
-    } catch (killError) {
-      // Ignorar erro se não houver processos para matar
-    }
+    } catch (killError) {}
 
     res.status(500).json({
       error: 'Concatenation failed',
@@ -828,7 +765,6 @@ app.post('/compress', authenticateApiKey, async (req, res) => {
     codec = 'libx264',
     audioCodec = 'aac',
     audioBitrate = '128k',
-    // Supabase upload config
     supabaseUrl,
     supabaseKey,
     outputPath
@@ -840,25 +776,22 @@ app.post('/compress', authenticateApiKey, async (req, res) => {
     return res.status(400).json({ error: 'videoUrl is required' });
   }
 
-  // Validar se tem configuração para upload no Supabase
   const uploadToSupabase = supabaseUrl && supabaseKey && outputPath;
 
   const compressId = `compress-${Date.now()}`;
   const tempDir = path.join('/tmp', compressId);
   
   try {
-    // 1. Criar diretório temporário
     await fs.mkdir(tempDir, { recursive: true });
     console.log(`[${compressId}] Created temp dir: ${tempDir}`);
 
-    // 2. Baixar vídeo original
     const inputFile = path.join(tempDir, 'input.mp4');
     console.log(`[${compressId}] 📥 Downloading from: ${videoUrl.substring(0, 80)}...`);
     
     const downloadStartTime = Date.now();
     const response = await fetch(videoUrl, {
       redirect: 'follow',
-      timeout: 600000 // 10 min
+      timeout: 600000
     });
     
     if (!response.ok) {
@@ -873,17 +806,16 @@ app.post('/compress', authenticateApiKey, async (req, res) => {
     const inputSizeMB = (inputStats.size / 1024 / 1024).toFixed(2);
     console.log(`[${compressId}] ✅ Downloaded: ${inputSizeMB} MB in ${downloadTime}s`);
 
-    // 3. Comprimir vídeo
     const outputFile = path.join(tempDir, `compressed.${outputFormat}`);
     console.log(`[${compressId}] 🗜️ Compressing with CRF=${crf}, preset=${preset}...`);
     
     const compressStartTime = Date.now();
-    const compressCommand = `ffmpeg -i "${inputFile}" \
+    const compressCommand = `ffmpeg -hide_banner -loglevel error -i "${inputFile}" \
       -c:v ${codec} -preset ${preset} -crf ${crf} \
       -maxrate ${maxBitrate} -bufsize ${parseInt(maxBitrate) * 2}M \
       -c:a ${audioCodec} -b:a ${audioBitrate} \
       -ar 48000 -ac 2 \
-      -af "aresample=async=1" \
+      -af "aresample=async=1:first_pts=0" \
       -vsync cfr \
       -async 1 \
       -fflags +genpts \
@@ -893,7 +825,7 @@ app.post('/compress', authenticateApiKey, async (req, res) => {
     
     await execAsync(compressCommand, {
       maxBuffer: 100 * 1024 * 1024,
-      timeout: 900000 // 15 min
+      timeout: 900000
     });
     
     const compressTime = ((Date.now() - compressStartTime) / 1000).toFixed(2);
@@ -903,7 +835,6 @@ app.post('/compress', authenticateApiKey, async (req, res) => {
     
     console.log(`[${compressId}] ✅ Compressed: ${inputSizeMB}MB → ${outputSizeMB}MB in ${compressTime}s (${compressionRatio}% reduction)`);
 
-    // 4. Upload para Supabase ou retornar base64
     if (uploadToSupabase) {
       console.log(`[${compressId}] 📤 Uploading to Supabase: ${outputPath}`);
       
@@ -926,7 +857,6 @@ app.post('/compress', authenticateApiKey, async (req, res) => {
 
       console.log(`[${compressId}] ✅ Upload complete`);
 
-      // Cleanup
       await fs.rm(tempDir, { recursive: true, force: true });
       console.log(`[${compressId}] ✅ Cleanup complete`);
 
@@ -940,11 +870,9 @@ app.post('/compress', authenticateApiKey, async (req, res) => {
       });
 
     } else {
-      // Fallback: retornar como base64
       const compressedBuffer = await fs.readFile(outputFile);
       const compressedBase64 = compressedBuffer.toString('base64');
 
-      // Cleanup
       await fs.rm(tempDir, { recursive: true, force: true });
       console.log(`[${compressId}] ✅ Cleanup complete`);
 
@@ -961,7 +889,6 @@ app.post('/compress', authenticateApiKey, async (req, res) => {
   } catch (error) {
     console.error(`[${compressId}] ❌ Error:`, error);
     
-    // Cleanup on error
     try {
       if (tempDir) {
         await fs.rm(tempDir, { recursive: true, force: true });
@@ -992,21 +919,17 @@ setInterval(async () => {
         const filePath = path.join(tmpDir, file);
         try {
           const stats = await fs.stat(filePath);
-          // Remover diretórios com mais de 1 hora
           if (now - stats.mtimeMs > 3600000) {
             await fs.rm(filePath, { recursive: true, force: true });
             cleanedCount++;
             console.log(`🗑️  Removed old temp dir: ${file}`);
           }
-        } catch (err) {
-          // Ignorar erros individuais
-        }
+        } catch (err) {}
       }
     }
     
     console.log(`✅ Cleanup complete: ${cleanedCount} old directories removed`);
     
-    // Matar processos FFmpeg orfãos
     try {
       const { stdout } = await execAsync('pgrep ffmpeg | wc -l');
       const processCount = parseInt(stdout.trim());
@@ -1014,9 +937,7 @@ setInterval(async () => {
         console.warn(`⚠️  Found ${processCount} FFmpeg processes, killing old ones...`);
         await execAsync('pkill -9 -f "ffmpeg.*project-"');
       }
-    } catch (err) {
-      // Ignorar se não houver processos
-    }
+    } catch (err) {}
   } catch (err) {
     console.error('Cleanup error:', err.message);
   }
