@@ -1,4 +1,4 @@
-// === server.js === (arquivo completo, com correções de áudio e upload)
+// === server.js === (arquivo completo, com correções de áudio e upload para R2)
 const express = require("express");
 const { exec } = require("child_process");
 const { promisify } = require("util");
@@ -6,6 +6,7 @@ const fs = require("fs").promises;
 const path = require("path");
 const fetch = require("node-fetch");
 const FormData = require("form-data");
+const crypto = require("crypto");
 
 const execAsync = promisify(exec);
 const app = express();
@@ -286,6 +287,67 @@ async function normalizeVideoWithRetries(inputFile, outputFile, targetDimensions
       );
     }
   }
+}
+
+// ============================================
+// AWS Signature V4 Helper Functions for R2
+// ============================================
+function sha256(data) {
+  return crypto.createHash('sha256').update(data).digest('hex');
+}
+
+function hmac(key, data) {
+  return crypto.createHmac('sha256', key).update(data).digest();
+}
+
+function getSignatureKey(key, dateStamp, regionName, serviceName) {
+  const kDate = hmac('AWS4' + key, dateStamp);
+  const kRegion = hmac(kDate, regionName);
+  const kService = hmac(kRegion, serviceName);
+  const kSigning = hmac(kService, 'aws4_request');
+  return kSigning;
+}
+
+async function generateR2SignedUrl(endpoint, bucket, key, accessKeyId, secretAccessKey, region, method = 'PUT') {
+  const url = new URL(`${endpoint}/${bucket}/${key}`);
+  const date = new Date();
+  const dateStamp = date.toISOString().slice(0, 10).replace(/-/g, '');
+  const amzDate = date.toISOString().replace(/[:-]|\.\d{3}/g, '');
+  
+  const credential = `${accessKeyId}/${dateStamp}/${region}/s3/aws4_request`;
+  const params = new URLSearchParams({
+    'X-Amz-Algorithm': 'AWS4-HMAC-SHA256',
+    'X-Amz-Credential': credential,
+    'X-Amz-Date': amzDate,
+    'X-Amz-Expires': '3600',
+    'X-Amz-SignedHeaders': 'host',
+  });
+
+  url.search = params.toString();
+
+  const canonicalRequest = [
+    method,
+    `/${bucket}/${key}`,
+    params.toString(),
+    `host:${url.host}`,
+    '',
+    'host',
+    'UNSIGNED-PAYLOAD'
+  ].join('\n');
+
+  const stringToSign = [
+    'AWS4-HMAC-SHA256',
+    amzDate,
+    `${dateStamp}/${region}/s3/aws4_request`,
+    sha256(canonicalRequest)
+  ].join('\n');
+
+  const signingKey = getSignatureKey(secretAccessKey, dateStamp, region, 's3');
+  const signature = hmac(signingKey, stringToSign).toString('hex');
+
+  url.searchParams.append('X-Amz-Signature', signature);
+
+  return url.toString();
 }
 
 // Main concatenation endpoint (protected)
@@ -665,58 +727,58 @@ app.post("/concatenate", authenticateApiKey, async (req, res) => {
       throw new Error(`Concatenation failed: ${concatError.message}`);
     }
 
-    // Upload to Supabase Storage
-    console.log(`[${projectId}] Uploading to storage...`);
+    // Upload to Cloudflare R2
+    console.log(`[${projectId}] Uploading to R2...`);
     const fileBuffer = await fs.readFile(outputPath);
 
     const storagePath = req.body.storagePath || `${projectId}/${outputFilename}`;
-    const uploadUrl = `${supabaseUrl}/storage/v1/object/videos/${storagePath}`;
+    
+    // Get R2 credentials from environment
+    const r2AccountId = process.env.R2_ACCOUNT_ID;
+    const r2AccessKeyId = process.env.R2_ACCESS_KEY_ID;
+    const r2SecretAccessKey = process.env.R2_SECRET_ACCESS_KEY;
 
-    try {
-      const deleteUrl = `${supabaseUrl}/storage/v1/object/videos/${storagePath}`;
-      const deleteResponse = await fetch(deleteUrl, {
-        method: "DELETE",
-        headers: {
-          Authorization: `Bearer ${supabaseKey}`,
-          apikey: supabaseKey,
-        },
-      });
-
-      if (deleteResponse.ok || deleteResponse.status === 404) {
-        console.log(`[${projectId}] Delete successful or file didn't exist: ${deleteResponse.status}`);
-      } else {
-        const deleteError = await deleteResponse.text();
-        console.warn(`[${projectId}] Delete warning (${deleteResponse.status}): ${deleteError}`);
-      }
-    } catch (deleteError) {
-      console.warn(`[${projectId}] Delete exception (continuing): ${deleteError.message}`);
+    if (!r2AccountId || !r2AccessKeyId || !r2SecretAccessKey) {
+      throw new Error('R2 credentials not configured in environment');
     }
 
-    const uploadResponse = await fetch(uploadUrl, {
-      method: "POST",
+    const bucket = 'video-parts-upload';
+    const r2Endpoint = `https://${r2AccountId}.r2.cloudflarestorage.com`;
+    const region = 'auto';
+
+    console.log(`[${projectId}] Generating signed URL for R2 path: ${storagePath}`);
+    
+    // Generate signed URL for upload
+    const signedUrl = await generateR2SignedUrl(
+      r2Endpoint,
+      bucket,
+      storagePath,
+      r2AccessKeyId,
+      r2SecretAccessKey,
+      region,
+      'PUT'
+    );
+
+    console.log(`[${projectId}] Uploading to R2 with signed URL...`);
+
+    const uploadResponse = await fetch(signedUrl, {
+      method: "PUT",
       headers: {
-        Authorization: `Bearer ${supabaseKey}`,
-        apikey: supabaseKey,
         "Content-Type": "video/mp4",
-        "x-upsert": "true",
       },
       body: fileBuffer,
     });
 
     if (!uploadResponse.ok) {
       const errorText = await uploadResponse.text();
-      console.error(`[${projectId}] Upload failed (${uploadResponse.status}):`, errorText);
-
-      if (uploadResponse.status === 409) {
-        throw new Error(`Upload failed: ${uploadResponse.status} - Duplicate file. Retry with unique name.`);
-      }
-
-      throw new Error(`Upload failed: ${uploadResponse.status} - ${errorText}`);
+      console.error(`[${projectId}] R2 upload failed (${uploadResponse.status}):`, errorText);
+      throw new Error(`R2 upload failed: ${uploadResponse.status} - ${errorText}`);
     }
 
-    console.log(`[${projectId}] Upload complete!`);
+    console.log(`[${projectId}] R2 upload complete!`);
 
-    const publicUrl = `${supabaseUrl}/storage/v1/object/public/videos/${storagePath}`;
+    // R2 path will be used to generate signed URLs via edge function
+    const publicUrl = `r2://${bucket}/${storagePath}`;
 
     try {
       await fs.rm(tempDir, { recursive: true, force: true });
