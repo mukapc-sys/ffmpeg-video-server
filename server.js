@@ -238,16 +238,17 @@ async function normalizeVideoWithRetries(inputFile, outputFile, targetDimensions
     try {
       const startTime = Date.now();
 
-      // 🔧 Flags robustas + áudio junto com vídeo (SEM -an). NÃO usamos aresample=async=1 aqui.
+      // 🔧 Flags robustas + áudio junto com vídeo + sync perfeito para vídeos comprimidos
       const normalizeCommand = `ffmpeg -hide_banner -loglevel error \
         -err_detect ignore_err -fflags +genpts -analyzeduration 100M -probesize 100M \
         -i "${inputFile}" \
-        -vf "scale=${targetDimensions.width}:${targetDimensions.height}:force_original_aspect_ratio=decrease,pad=${targetDimensions.width}:${targetDimensions.height}:(ow-iw)/2:(oh-ih)/2:black,setsar=1${attempt.extraFilters}" \
+        -vf "scale=${targetDimensions.width}:${targetDimensions.height}:force_original_aspect_ratio=decrease,pad=${targetDimensions.width}:${targetDimensions.height}:(ow-iw)/2:(oh-ih)/2:black,setsar=1,setpts=PTS-STARTPTS${attempt.extraFilters}" \
+        -af "aresample=async=1:first_pts=0,asetpts=PTS-STARTPTS" \
         -r 30 \
         -c:v libx264 -preset ${attempt.preset} -crf ${attempt.crf} \
         -maxrate 1.5M -bufsize 3M \
         -c:a aac -b:a 128k -ar 48000 -ac 2 \
-        -vsync cfr -avoid_negative_ts make_zero -xerror \
+        -vsync cfr -async 1 -avoid_negative_ts make_zero -xerror \
         -movflags +faststart \
         -max_muxing_queue_size 2048 \
         -y "${outputFile}"`;
