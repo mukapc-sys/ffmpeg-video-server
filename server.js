@@ -417,19 +417,21 @@ app.post('/concatenate', authenticateApiKey, async (req, res) => {
     console.log(`[${projectId}] ✅ Todos os ${downloadedFiles.length} vídeos passaram na validação`);
 
     // ============================================
-    // ETAPA 1.5: EXTRAIR ÁUDIOS ORIGINAIS (SEM RE-ENCODING)
+    // ETAPA 1.5: EXTRAIR E NORMALIZAR ÁUDIOS PARA AAC
     // ============================================
-    console.log(`[${projectId}] 🎵 ETAPA 1.5: Extraindo áudios originais (sem re-encoding)...`);
+    console.log(`[${projectId}] 🎵 ETAPA 1.5: Extraindo e normalizando áudios para AAC...`);
     
     const extractedAudios = [];
     for (let i = 0; i < downloadedFiles.length; i++) {
       const audioFile = path.join(tempDir, `audio-${i}.aac`);
-      const extractCommand = `ffmpeg -i "${downloadedFiles[i]}" -vn -c:a copy -y "${audioFile}"`;
+      // Normalizar para AAC 128k para garantir compatibilidade
+      const extractCommand = `ffmpeg -i "${downloadedFiles[i]}" -vn -c:a aac -b:a 128k -ar 48000 -ac 2 -y "${audioFile}"`;
       
       try {
         await execAsync(extractCommand, { timeout: 60000 });
+        const audioStats = await fs.stat(audioFile);
         extractedAudios.push(audioFile);
-        console.log(`[${projectId}] ✅ Áudio ${i + 1} extraído (codec original mantido)`);
+        console.log(`[${projectId}] ✅ Áudio ${i + 1} extraído e normalizado (${(audioStats.size / 1024).toFixed(2)} KB)`);
       } catch (extractError) {
         console.error(`[${projectId}] ❌ Erro ao extrair áudio ${i + 1}:`, extractError.message);
         throw new Error(`Falha ao extrair áudio do vídeo ${i + 1}`);
@@ -441,13 +443,15 @@ app.post('/concatenate', authenticateApiKey, async (req, res) => {
     const audioConcatContent = extractedAudios.map(f => `file '${f}'`).join('\n');
     await fs.writeFile(audioConcatFile, audioConcatContent);
     
+    console.log(`[${projectId}] 📝 Lista de áudios para concatenação:\n${audioConcatContent}`);
+    
     const finalAudioPath = path.join(tempDir, 'final-audio.aac');
     const audioConcatCommand = `ffmpeg -f concat -safe 0 -i "${audioConcatFile}" -c copy -y "${finalAudioPath}"`;
     
     try {
       await execAsync(audioConcatCommand, { timeout: 120000 });
       const audioStats = await fs.stat(finalAudioPath);
-      console.log(`[${projectId}] ✅ Áudios concatenados (${(audioStats.size / 1024 / 1024).toFixed(2)} MB, codec original mantido)`);
+      console.log(`[${projectId}] ✅ Áudios concatenados (${(audioStats.size / 1024 / 1024).toFixed(2)} MB, ${extractedAudios.length} arquivos)`);
     } catch (concatError) {
       console.error(`[${projectId}] ❌ Erro ao concatenar áudios:`, concatError.message);
       throw new Error('Falha ao concatenar áudios');
