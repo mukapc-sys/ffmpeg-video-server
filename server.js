@@ -531,6 +531,7 @@ app.post('/concatenate', authenticateApiKey, async (req, res) => {
     // ETAPA 3: CONCATENAÇÃO RÁPIDA (APENAS VÍDEOS, SEM ÁUDIO)
     // ============================================
     const videoOnlyPath = path.join(tempDir, `video-only-${outputFilename}`);
+    const outputPath = path.join(tempDir, outputFilename); // DECLARAR AQUI para estar disponível em todo o escopo
     console.log(`[${projectId}] 🎬 ETAPA 3: Concatenando ${normalizedFiles.length} vídeos normalizados (sem áudio)...`);
     console.log(`[${projectId}] Video-only output will be: ${videoOnlyPath}`);
     
@@ -565,7 +566,6 @@ app.post('/concatenate', authenticateApiKey, async (req, res) => {
       // ============================================
       // COMPRESSÃO ITERATIVA ATÉ < 49MB (SOMENTE VÍDEO)
       // ============================================
-      const outputPath = path.join(tempDir, outputFilename); // Declarar ANTES do if
       const MAX_SIZE_MB = 49;
       const MAX_CRF = 35; // CRF máximo antes de desistir
       let currentSizeMB = videoOnlyStats.size / 1024 / 1024;
