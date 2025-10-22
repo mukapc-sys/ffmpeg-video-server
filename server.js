@@ -691,14 +691,12 @@ app.post('/concatenate', authenticateApiKey, async (req, res) => {
         -movflags +faststart \
         -y "${outputPath}"`;
       
-      try {
-        await execAsync(addAudioCommand, { timeout: 180000 });
-        const finalStats = await fs.stat(outputPath);
-        console.log(`[${projectId}] ✅ Áudio original adicionado ao vídeo final!`);
-        console.log(`[${projectId}] ✅ Vídeo final completo: ${(finalStats.size / 1024 / 1024).toFixed(2)} MB`);
-        
-        let outputStats = finalStats;
-      }
+      await execAsync(addAudioCommand, { timeout: 180000 });
+      const finalStats = await fs.stat(outputPath);
+      console.log(`[${projectId}] ✅ Áudio original adicionado ao vídeo final!`);
+      console.log(`[${projectId}] ✅ Vídeo final completo: ${(finalStats.size / 1024 / 1024).toFixed(2)} MB`);
+      
+      let outputStats = finalStats;
       
     } catch (concatError) {
       console.error(`[${projectId}] Concatenation failed:`, concatError.message);
