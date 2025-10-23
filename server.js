@@ -101,34 +101,34 @@ app.get("/diagnostics", async (req, res) => {
 // AWS Signature V4 Helper Functions for R2
 // ============================================
 function sha256(data) {
-  return crypto.createHash('sha256').update(data).digest('hex');
+  return crypto.createHash("sha256").update(data).digest("hex");
 }
 
 function hmac(key, data) {
-  return crypto.createHmac('sha256', key).update(data).digest();
+  return crypto.createHmac("sha256", key).update(data).digest();
 }
 
 function getSignatureKey(key, dateStamp, regionName, serviceName) {
-  const kDate = hmac('AWS4' + key, dateStamp);
+  const kDate = hmac("AWS4" + key, dateStamp);
   const kRegion = hmac(kDate, regionName);
   const kService = hmac(kRegion, serviceName);
-  const kSigning = hmac(kService, 'aws4_request');
+  const kSigning = hmac(kService, "aws4_request");
   return kSigning;
 }
 
-async function generateR2SignedUrl(endpoint, bucket, key, accessKeyId, secretAccessKey, region, method = 'PUT') {
+async function generateR2SignedUrl(endpoint, bucket, key, accessKeyId, secretAccessKey, region, method = "PUT") {
   const url = new URL(`${endpoint}/${bucket}/${key}`);
   const date = new Date();
-  const dateStamp = date.toISOString().slice(0, 10).replace(/-/g, '');
-  const amzDate = date.toISOString().replace(/[:-]|\.\d{3}/g, '');
-  
+  const dateStamp = date.toISOString().slice(0, 10).replace(/-/g, "");
+  const amzDate = date.toISOString().replace(/[:-]|\.\d{3}/g, "");
+
   const credential = `${accessKeyId}/${dateStamp}/${region}/s3/aws4_request`;
   const params = new URLSearchParams({
-    'X-Amz-Algorithm': 'AWS4-HMAC-SHA256',
-    'X-Amz-Credential': credential,
-    'X-Amz-Date': amzDate,
-    'X-Amz-Expires': '3600',
-    'X-Amz-SignedHeaders': 'host',
+    "X-Amz-Algorithm": "AWS4-HMAC-SHA256",
+    "X-Amz-Credential": credential,
+    "X-Amz-Date": amzDate,
+    "X-Amz-Expires": "3600",
+    "X-Amz-SignedHeaders": "host",
   });
 
   url.search = params.toString();
@@ -138,29 +138,39 @@ async function generateR2SignedUrl(endpoint, bucket, key, accessKeyId, secretAcc
     `/${bucket}/${key}`,
     params.toString(),
     `host:${url.host}`,
-    '',
-    'host',
-    'UNSIGNED-PAYLOAD'
-  ].join('\n');
+    "",
+    "host",
+    "UNSIGNED-PAYLOAD",
+  ].join("\n");
 
   const stringToSign = [
-    'AWS4-HMAC-SHA256',
+    "AWS4-HMAC-SHA256",
     amzDate,
     `${dateStamp}/${region}/s3/aws4_request`,
-    sha256(canonicalRequest)
-  ].join('\n');
+    sha256(canonicalRequest),
+  ].join("\n");
 
-  const signingKey = getSignatureKey(secretAccessKey, dateStamp, region, 's3');
-  const signature = hmac(signingKey, stringToSign).toString('hex');
+  const signingKey = getSignatureKey(secretAccessKey, dateStamp, region, "s3");
+  const signature = hmac(signingKey, stringToSign).toString("hex");
 
-  url.searchParams.append('X-Amz-Signature', signature);
+  url.searchParams.append("X-Amz-Signature", signature);
 
   return url.toString();
 }
 
 // Main concatenation endpoint (protected)
 app.post("/concatenate", authenticateApiKey, async (req, res) => {
-  const { videoUrls, outputFilename, projectId, format, supabaseUrl, supabaseKey, r2AccountId, r2AccessKeyId, r2SecretAccessKey } = req.body;
+  const {
+    videoUrls,
+    outputFilename,
+    projectId,
+    format,
+    supabaseUrl,
+    supabaseKey,
+    r2AccountId,
+    r2AccessKeyId,
+    r2SecretAccessKey,
+  } = req.body;
 
   console.log(`[${projectId}] 📥 Received request - Format: ${format}, Videos: ${videoUrls?.length}`);
 
@@ -251,16 +261,27 @@ app.post("/concatenate", authenticateApiKey, async (req, res) => {
     console.log(`[${projectId}] Concat content:\n${concatContent}`);
 
     // ============================================
-    // CONCATENAÇÃO DIRETA (vídeo + áudio) - codec copy
+    // CONCATENAÇÃO COM RECODIFICAÇÃO (garantir A/V sync perfeito)
     // ============================================
     const outputPath = path.join(tempDir, outputFilename);
     console.log(`[${projectId}] 🎬 Concatenando ${downloadedFiles.length} vídeos (com áudio)...`);
     console.log(`[${projectId}] Output: ${outputPath}`);
 
-    console.log(`[${projectId}] Using fast concat (codec copy - vídeos já normalizados)`);
+    console.log(`[${projectId}] Using re-encode concat (garantir sincronização A/V)`);
+    // CRÍTICO: Recodificar para garantir sincronização perfeita entre vídeos normalizados e não-normalizados
+    // Usar os mesmos parâmetros do normalize-server.js
     const ffmpegCommand = `ffmpeg -hide_banner -loglevel error -f concat -safe 0 -i "${concatFilePath}" \
-      -c copy \
+      -c:v libx264 -preset veryfast -crf 23 -tune fastdecode \
+      -c:a aac -b:a 128k -ar 44100 -ac 2 \
+      -af "loudnorm=I=-16:LRA=11:TP=-1.5,aresample=async=1" \
       -movflags +faststart \
+      -pix_fmt yuv420p \
+      -r 30 \
+      -vsync cfr \
+      -async 1 \
+      -avoid_negative_ts make_zero \
+      -fflags +genpts \
+      -threads 0 \
       -y "${outputPath}"`;
 
     try {
@@ -273,7 +294,7 @@ app.post("/concatenate", authenticateApiKey, async (req, res) => {
 
       const outputStats = await fs.stat(outputPath);
       const sizeMB = (outputStats.size / 1024 / 1024).toFixed(2);
-      
+
       console.log(`[${projectId}] ✅ Concatenation complete in ${concatTime}s!`);
       console.log(`[${projectId}] Final video size: ${sizeMB} MB`);
 
@@ -297,18 +318,18 @@ app.post("/concatenate", authenticateApiKey, async (req, res) => {
     const fileBuffer = await fs.readFile(outputPath);
 
     const storagePath = req.body.storagePath || `${projectId}/${outputFilename}`;
-    
+
     // R2 credentials should come from request payload (passed from edge function)
     if (!r2AccountId || !r2AccessKeyId || !r2SecretAccessKey) {
-      throw new Error('R2 credentials not provided in request');
+      throw new Error("R2 credentials not provided in request");
     }
 
-    const bucket = 'video-parts-upload';
+    const bucket = "video-parts-upload";
     const r2Endpoint = `https://${r2AccountId}.r2.cloudflarestorage.com`;
-    const region = 'auto';
+    const region = "auto";
 
     console.log(`[${projectId}] Generating signed URL for R2 path: ${storagePath}`);
-    
+
     // Generate signed URL for upload
     const signedUrl = await generateR2SignedUrl(
       r2Endpoint,
@@ -317,7 +338,7 @@ app.post("/concatenate", authenticateApiKey, async (req, res) => {
       r2AccessKeyId,
       r2SecretAccessKey,
       region,
-      'PUT'
+      "PUT",
     );
 
     console.log(`[${projectId}] Uploading to R2 with signed URL...`);
@@ -585,4 +606,4 @@ server.timeout = 300000; // 5 minutos - tempo máximo de processamento
 server.keepAliveTimeout = 310000; // 5min + 10s - mantém conexão viva
 server.headersTimeout = 320000; // 5min + 20s - tempo para receber headers
 
-console.log(`⏱️  Server timeouts: ${server.timeout/1000}s processing, ${server.keepAliveTimeout/1000}s keep-alive`);
+console.log(`⏱️  Server timeouts: ${server.timeout / 1000}s processing, ${server.keepAliveTimeout / 1000}s keep-alive`);
