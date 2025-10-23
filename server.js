@@ -341,13 +341,6 @@ app.post("/concatenate", authenticateApiKey, async (req, res) => {
     if (outputStats.size < 1000) {
       throw new Error(`Output video muito pequeno (${outputStats.size} bytes)`);
     }
-    
-    // Cleanup e continuar...
-    try {
-        console.error(`[${projectId}] FFmpeg stderr:`, concatError.stderr);
-      }
-      throw new Error(`Concatenation failed: ${concatError.message}`);
-    }
 
     // Upload to Cloudflare R2
     console.log(`[${projectId}] Uploading to R2...`);
