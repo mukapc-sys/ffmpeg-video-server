@@ -1,4 +1,4 @@
-// === server.js === (arquivo completo, com correções de áudio e upload para R2)
+// === server.js === (arquivo completo com correções de áudio e upload para R2)
 const express = require("express");
 const { exec } = require("child_process");
 const { promisify } = require("util");
