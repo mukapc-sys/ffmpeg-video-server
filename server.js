@@ -261,53 +261,89 @@ app.post("/concatenate", authenticateApiKey, async (req, res) => {
     console.log(`[${projectId}] Concat content:\n${concatContent}`);
 
     // ============================================
-    // CONCATENAÇÃO COM RECODIFICAÇÃO (garantir A/V sync perfeito)
+    // CONCATENAÇÃO HÍBRIDA (stream copy → re-encode se falhar)
     // ============================================
     const outputPath = path.join(tempDir, outputFilename);
-    console.log(`[${projectId}] 🎬 Concatenando ${downloadedFiles.length} vídeos (com áudio)...`);
+    console.log(`[${projectId}] 🎬 Concatenando ${downloadedFiles.length} vídeos...`);
     console.log(`[${projectId}] Output: ${outputPath}`);
 
-    console.log(`[${projectId}] Using re-encode concat (garantir sincronização A/V)`);
-    // CRÍTICO: Recodificar para garantir sincronização perfeita entre vídeos normalizados e não-normalizados
-    // Usar os mesmos parâmetros do normalize-server.js
-    const ffmpegCommand = `ffmpeg -hide_banner -loglevel error -f concat -safe 0 -i "${concatFilePath}" \
-      -c:v libx264 -preset veryfast -crf 23 -tune fastdecode \
-      -c:a aac -b:a 128k -ar 44100 -ac 2 \
-      -af "loudnorm=I=-16:LRA=11:TP=-1.5,aresample=async=1" \
+    // ESTRATÉGIA: Como os vídeos JÁ foram normalizados (1080x1920, 30fps, H.264)
+    // 1. Tentar stream copy primeiro (RÁPIDO - sem re-encode)
+    // 2. Se falhar, fazer re-encode leve
+    
+    let concatSuccess = false;
+    let concatTime = 0;
+    
+    // TENTATIVA 1: Stream Copy (instantâneo)
+    console.log(`[${projectId}] 🚀 Tentando stream copy (rápido)...`);
+    const streamCopyCommand = `ffmpeg -hide_banner -loglevel error -f concat -safe 0 -i "${concatFilePath}" \
+      -c copy \
       -movflags +faststart \
-      -pix_fmt yuv420p \
-      -r 30 \
-      -vsync cfr \
-      -async 1 \
-      -avoid_negative_ts make_zero \
-      -fflags +genpts \
-      -threads 0 \
       -y "${outputPath}"`;
-
+    
     try {
       const concatStartTime = Date.now();
-      const { stdout, stderr } = await execAsync(ffmpegCommand, {
-        timeout: 600000,
-      });
+      await execAsync(streamCopyCommand, { timeout: 120000 }); // 2 min timeout
+      concatTime = ((Date.now() - concatStartTime) / 1000).toFixed(2);
+      concatSuccess = true;
+      console.log(`[${projectId}] ✅ Stream copy sucesso em ${concatTime}s!`);
+    } catch (streamCopyError) {
+      console.log(`[${projectId}] ⚠️ Stream copy falhou, tentando re-encode...`);
+    }
+    
+    // TENTATIVA 2: Re-encode leve (se stream copy falhou)
+    if (!concatSuccess) {
+      console.log(`[${projectId}] 🔄 Fazendo re-encode com preset ultrafast...`);
+      const reencodeCommand = `ffmpeg -hide_banner -loglevel error -f concat -safe 0 -i "${concatFilePath}" \
+        -c:v libx264 -preset ultrafast -crf 23 \
+        -c:a aac -b:a 128k -ar 44100 -ac 2 \
+        -movflags +faststart \
+        -pix_fmt yuv420p \
+        -r 30 \
+        -vsync cfr \
+        -async 1 \
+        -avoid_negative_ts make_zero \
+        -fflags +genpts \
+        -threads 0 \
+        -y "${outputPath}"`;
+      
+      try {
+        const concatStartTime = Date.now();
+        const { stdout, stderr } = await execAsync(reencodeCommand, {
+          timeout: 600000, // 10 min timeout
+        });
 
-      const concatTime = ((Date.now() - concatStartTime) / 1000).toFixed(2);
-
-      const outputStats = await fs.stat(outputPath);
-      const sizeMB = (outputStats.size / 1024 / 1024).toFixed(2);
-
-      console.log(`[${projectId}] ✅ Concatenation complete in ${concatTime}s!`);
-      console.log(`[${projectId}] Final video size: ${sizeMB} MB`);
-
-      if (outputStats.size < 1000) {
-        throw new Error(`Output video is too small (${outputStats.size} bytes), concatenation likely failed`);
+        concatTime = ((Date.now() - concatStartTime) / 1000).toFixed(2);
+        concatSuccess = true;
+        console.log(`[${projectId}] ✅ Re-encode completo em ${concatTime}s!`);
+        
+        if (stderr && stderr.includes("Error")) {
+          console.warn(`[${projectId}] FFmpeg warning:`, stderr);
+        }
+      } catch (reencodeError) {
+        console.error(`[${projectId}] ❌ Re-encode falhou:`, reencodeError.message);
+        if (reencodeError.stderr) {
+          console.error(`[${projectId}] FFmpeg stderr:`, reencodeError.stderr);
+        }
+        throw reencodeError;
       }
-
-      if (stderr && stderr.includes("Error")) {
-        console.warn(`[${projectId}] FFmpeg concatenation warning:`, stderr);
-      }
-    } catch (concatError) {
-      console.error(`[${projectId}] Concatenation failed:`, concatError.message);
-      if (concatError.stderr) {
+    }
+    
+    // Validar output final
+    if (!concatSuccess) {
+      throw new Error('Ambas tentativas de concatenação falharam (stream copy e re-encode)');
+    }
+    
+    const outputStats = await fs.stat(outputPath);
+    const sizeMB = (outputStats.size / 1024 / 1024).toFixed(2);
+    console.log(`[${projectId}] 📦 Vídeo final: ${sizeMB} MB (tempo: ${concatTime}s)`);
+    
+    if (outputStats.size < 1000) {
+      throw new Error(`Output video muito pequeno (${outputStats.size} bytes)`);
+    }
+    
+    // Cleanup e continuar...
+    try {
         console.error(`[${projectId}] FFmpeg stderr:`, concatError.stderr);
       }
       throw new Error(`Concatenation failed: ${concatError.message}`);
