@@ -238,18 +238,17 @@ async function normalizeVideoWithRetries(inputFile, outputFile, targetDimensions
     try {
       const startTime = Date.now();
 
-      // 🔧 Flags robustas + áudio junto com vídeo + sync perfeito para vídeos comprimidos
-      // ✅ Removido aresample=async=1 que causava stretch/pitch issues
+      // 🔧 CRÍTICO: NÃO forçar framerate para manter sincronização!
+      // ✅ Removido -r 30 e aresample=async=1 que causavam dessincronia
       const normalizeCommand = `ffmpeg -hide_banner -loglevel error \
         -err_detect ignore_err -fflags +genpts -analyzeduration 100M -probesize 100M \
         -i "${inputFile}" \
         -vf "scale=${targetDimensions.width}:${targetDimensions.height}:force_original_aspect_ratio=decrease,pad=${targetDimensions.width}:${targetDimensions.height}:(ow-iw)/2:(oh-ih)/2:black,setsar=1,setpts=PTS-STARTPTS${attempt.extraFilters}" \
-        -af "asetpts=PTS-STARTPTS" \
-        -r 30 \
+        -af "asetpts=PTS-STARTPTS,aresample=async=1" \
         -c:v libx264 -preset ${attempt.preset} -crf ${attempt.crf} \
         -maxrate 1.5M -bufsize 3M \
         -c:a aac -b:a 128k -ar 48000 -ac 2 \
-        -vsync cfr -async 1 -avoid_negative_ts make_zero -xerror \
+        -vsync 2 -async 1 -avoid_negative_ts make_zero -xerror \
         -movflags +faststart \
         -max_muxing_queue_size 2048 \
         -y "${outputFile}"`;
