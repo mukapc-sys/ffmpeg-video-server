@@ -98,7 +98,7 @@ app.get("/diagnostics", async (req, res) => {
 });
 
 // ============================================
-// VALIDATION AND NORMALIZATION FUNCTIONS
+// VALIDATION FUNCTIONS
 // ============================================
 
 /**
@@ -114,7 +114,7 @@ async function validateVideoFile(filepath, projectId, videoIndex) {
       throw new Error(`Arquivo muito pequeno (${stats.size} bytes)`);
     }
 
-    // ffprobe para validar estrutura do vídeo (⬅️ ADICIONADO analyzeduration/probesize)
+    // ffprobe para validar estrutura do vídeo
     const probeCmd = `ffprobe -v error -analyzeduration 100M -probesize 100M -select_streams v:0 -count_packets -show_entries stream=codec_name,width,height,r_frame_rate,duration,nb_read_packets -of json "${filepath}"`;
     const { stdout } = await execAsync(probeCmd, { timeout: 30000 });
     const probeData = JSON.parse(stdout);
@@ -156,137 +156,6 @@ async function validateVideoFile(filepath, projectId, videoIndex) {
       isValid: false,
       error: error.message,
     };
-  }
-}
-
-/**
- * Decide if video needs normalization based on specs
- * Returns TRUE if re-encode is needed, FALSE if can use fast-path
- * (mantive sua lógica; se quiser, podemos forçar sempre true)
- */
-function shouldNormalizeVideo(validationData, targetDimensions) {
-  const { codec, width, height, fps } = validationData;
-
-  const isCorrectCodec = codec === "h264";
-  const isCorrectWidth = width === targetDimensions.width;
-  const isCorrectHeight = height === targetDimensions.height;
-  const isCorrectFps = fps && (fps === "30/1" || fps === "30" || fps === "60/1");
-
-  const canSkipNormalization = isCorrectCodec && isCorrectWidth && isCorrectHeight && isCorrectFps;
-
-  if (canSkipNormalization) {
-    console.log(`✅ Vídeo JÁ está no formato ideal (${codec}, ${width}x${height}, ${fps}fps) - PULANDO re-encode`);
-    return false;
-  }
-
-  console.log(`⚠️ Vídeo precisa de normalização: codec=${codec}, dimensões=${width}x${height}, fps=${fps}`);
-  return true;
-}
-
-/**
- * Fast-path: Stream copy without re-encoding (10x faster)
- * Falls back to normalization if fails
- */
-async function fastCopyVideo(inputFile, outputFile, projectId, videoIndex) {
-  try {
-    console.log(`[${projectId}] ⚡ FAST-PATH: Copiando streams do vídeo ${videoIndex} (sem re-encode)...`);
-    const startTime = Date.now();
-
-    const copyCommand = `ffmpeg -i "${inputFile}" \
-      -c copy \
-      -movflags +faststart \
-      -fflags +genpts \
-      -avoid_negative_ts make_zero \
-      -y "${outputFile}"`;
-
-    await execAsync(copyCommand, {
-      maxBuffer: 100 * 1024 * 1024,
-      timeout: 60000,
-    });
-
-    const stats = await fs.stat(outputFile);
-    if (stats.size < 1000) {
-      throw new Error(`Arquivo copiado muito pequeno (${stats.size} bytes)`);
-    }
-
-    const duration = ((Date.now() - startTime) / 1000).toFixed(2);
-    console.log(`[${projectId}] ⚡ FAST-PATH completo em ${duration}s (${(stats.size / 1024 / 1024).toFixed(2)} MB)`);
-
-    return { success: true, method: "Fast Stream Copy" };
-  } catch (error) {
-    console.error(`[${projectId}] ❌ Fast-path falhou (não é fatal):`, error.message);
-    throw error;
-  }
-}
-
-/**
- * Normalize video with 3-level fallback strategy
- * ⬅️ AGORA normaliza VÍDEO + ÁUDIO juntos, com sync garantido
- * ✅ CORRIGIDO: Removido aresample=async=1 que causava desincronização
- */
-async function normalizeVideoWithRetries(inputFile, outputFile, targetDimensions, projectId, videoIndex) {
-  const attempts = [
-    { name: "Normalização Rápida", preset: "fast", crf: 23, extraFilters: "" },
-    { name: "Normalização Robusta", preset: "medium", crf: 25, extraFilters: ",format=yuv420p" },
-    { name: "Re-encode Total Forçado", preset: "slow", crf: 28, extraFilters: ",format=yuv420p,setpts=PTS-STARTPTS" },
-  ];
-
-  for (let attemptIndex = 0; attemptIndex < attempts.length; attemptIndex++) {
-    const attempt = attempts[attemptIndex];
-    console.log(`[${projectId}] 🔄 Tentativa ${attemptIndex + 1}/3: ${attempt.name} (vídeo ${videoIndex})`);
-
-    try {
-      const startTime = Date.now();
-
-      // 🔧 CRÍTICO: NÃO forçar framerate para manter sincronização!
-      // ✅ Removido -r 30 e aresample=async=1 que causavam dessincronia
-      const normalizeCommand = `ffmpeg -hide_banner -loglevel error \
-        -err_detect ignore_err -fflags +genpts -analyzeduration 100M -probesize 100M \
-        -i "${inputFile}" \
-        -vf "scale=${targetDimensions.width}:${targetDimensions.height}:force_original_aspect_ratio=decrease,pad=${targetDimensions.width}:${targetDimensions.height}:(ow-iw)/2:(oh-ih)/2:black,setsar=1,setpts=PTS-STARTPTS${attempt.extraFilters}" \
-        -af "asetpts=PTS-STARTPTS,aresample=async=1" \
-        -c:v libx264 -preset ${attempt.preset} -crf ${attempt.crf} \
-        -maxrate 1.5M -bufsize 3M \
-        -c:a aac -b:a 128k -ar 48000 -ac 2 \
-        -vsync 2 -async 1 -avoid_negative_ts make_zero -xerror \
-        -movflags +faststart \
-        -max_muxing_queue_size 2048 \
-        -y "${outputFile}"`;
-
-      const { stdout, stderr } = await execAsync(normalizeCommand, {
-        maxBuffer: 100 * 1024 * 1024,
-        timeout: 900000,
-      });
-
-      if (stderr) {
-        console.log(`[${projectId}] ⚙️ Normalização (stderr parcial):`, stderr.substring(0, 600));
-      }
-
-      const stats = await fs.stat(outputFile);
-      if (stats.size < 1000) {
-        throw new Error(`Arquivo normalizado muito pequeno (${stats.size} bytes)`);
-      }
-
-      const duration = ((Date.now() - startTime) / 1000).toFixed(2);
-      console.log(
-        `[${projectId}] ✅ Vídeo ${videoIndex} normalizado com sucesso em ${duration}s (${(stats.size / 1024 / 1024).toFixed(2)} MB) via ${attempt.name}`,
-      );
-
-      return { success: true, method: attempt.name };
-    } catch (error) {
-      console.error(`[${projectId}] ❌ ${attempt.name} falhou:`, error.message);
-      if (error.stderr) console.error(`[${projectId}] 📋 FFmpeg stderr completo:`, error.stderr.substring(0, 1000));
-      if (error.code) console.error(`[${projectId}] 💥 Exit code:`, error.code);
-      if (error.signal) console.error(`[${projectId}] ⚡ Signal:`, error.signal);
-
-      if (attemptIndex < attempts.length - 1) {
-        console.log(`[${projectId}] ⚠️ Tentando próximo método...`);
-        continue;
-      }
-      throw new Error(
-        `Todas as 3 tentativas de normalização falharam para vídeo ${videoIndex}. Último erro: ${error.message}.`,
-      );
-    }
   }
 }
 
@@ -489,56 +358,16 @@ app.post("/concatenate", authenticateApiKey, async (req, res) => {
     }
 
     // ============================================
-    // ETAPA 2: NORMALIZAÇÃO INTELIGENTE (AGORA VÍDEO + ÁUDIO, MAS A GENTE SÓ USA O VÍDEO DEPOIS)
+    // ETAPA 2: PREPARAR ARQUIVOS PARA CONCATENAÇÃO
+    // (Vídeos já vêm normalizados do servidor de normalização dedicado)
     // ============================================
-    console.log(`[${projectId}] 🔄 ETAPA 2: Verificando necessidade de normalização...`);
+    console.log(`[${projectId}] 📝 ETAPA 2: Preparando vídeos normalizados para concatenação...`);
 
-    const normalizedFiles = [];
-
-    for (let i = 0; i < downloadedFiles.length; i++) {
-      const inputFile = downloadedFiles[i];
-      const normalizedFile = path.join(tempDir, `normalized-${i}.mp4`);
-      const validation = validationResults[i];
-
-      console.log(
-        `[${projectId}] 📹 Vídeo ${i + 1}/${downloadedFiles.length}: ${validation.codec} ${validation.width}x${validation.height} ${validation.fps}fps`,
-      );
-
-      const needsNormalization = shouldNormalizeVideo(validation, targetDimensions);
-
-      if (needsNormalization) {
-        console.log(`[${projectId}] 🔄 Normalizando vídeo ${i + 1} (re-encode necessário)...`);
-
-        const result = await normalizeVideoWithRetries(inputFile, normalizedFile, targetDimensions, projectId, i + 1);
-
-        normalizedFiles.push(normalizedFile);
-        console.log(`[${projectId}] ✅ Vídeo ${i + 1} normalizado via: ${result.method}`);
-      } else {
-        console.log(`[${projectId}] ⚡ Vídeo ${i + 1} JÁ está perfeito, usando fast-path...`);
-
-        try {
-          const result = await fastCopyVideo(inputFile, normalizedFile, projectId, i + 1);
-
-          normalizedFiles.push(normalizedFile);
-          console.log(`[${projectId}] ✅ ${result.method} - 10x mais rápido que re-encode!`);
-        } catch (fastPathError) {
-          console.log(`[${projectId}] ⚠️ Fast-path falhou, usando re-encode como fallback...`);
-
-          const result = await normalizeVideoWithRetries(inputFile, normalizedFile, targetDimensions, projectId, i + 1);
-
-          normalizedFiles.push(normalizedFile);
-          console.log(`[${projectId}] ✅ Vídeo ${i + 1} normalizado via fallback: ${result.method}`);
-        }
-      }
-    }
-
-    console.log(`[${projectId}] ✅ Todos os ${normalizedFiles.length} vídeos prontos para concatenação`);
-
-    // Create concat file for FFmpeg using normalized files
+    // Create concat file for FFmpeg using downloaded files (já normalizados)
     const concatFilePath = path.join(tempDir, "concat.txt");
-    const concatContent = normalizedFiles.map((f) => `file '${f}'`).join("\n");
+    const concatContent = downloadedFiles.map((f) => `file '${f}'`).join("\n");
     await fs.writeFile(concatFilePath, concatContent);
-    console.log(`[${projectId}] 📝 Created concat file with ${normalizedFiles.length} videos`);
+    console.log(`[${projectId}] 📝 Created concat file with ${downloadedFiles.length} videos`);
     console.log(`[${projectId}] Concat content:\n${concatContent}`);
 
     // ============================================
