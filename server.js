@@ -625,7 +625,6 @@ app.post('/generate-zip', authenticateApiKey, async (req, res) => {
         // Pausa a cada 10 vídeos para liberar memória
         if (i < videos.length - 1 && (i + 1) % 10 === 0) {
           await new Promise(resolve => setTimeout(resolve, 200));
-          if (global.gc) global.gc();
         }
         
       } catch (err) {
