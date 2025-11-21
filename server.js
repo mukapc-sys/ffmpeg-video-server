@@ -7,6 +7,7 @@ const path = require("path");
 const fetch = require("node-fetch");
 const FormData = require("form-data");
 const crypto = require("crypto");
+const JSZip = require("jszip");
 
 const execAsync = promisify(exec);
 const app = express();
@@ -579,6 +580,90 @@ app.post("/compress", authenticateApiKey, async (req, res) => {
       error: "Compression failed",
       details: error.message,
     });
+  }
+});
+
+// ============================================
+// ENDPOINT: GENERATE ZIP
+// ============================================
+app.post('/generate-zip', authenticateApiKey, async (req, res) => {
+  try {
+    const { videos, projectId, userId, productCode } = req.body;
+    
+    if (!videos || !Array.isArray(videos) || videos.length === 0) {
+      return res.status(400).json({ error: 'Videos array is required' });
+    }
+
+    console.log(`📦 [${projectId}] Gerando ZIP para ${videos.length} vídeos`);
+
+    const zip = new JSZip();
+    let processed = 0;
+    let failed = 0;
+
+    // Processar vídeos sequencialmente
+    for (let i = 0; i < videos.length; i++) {
+      const video = videos[i];
+      
+      try {
+        console.log(`📥 [${projectId}] ${i + 1}/${videos.length}: ${video.filename}`);
+        
+        // Baixar vídeo
+        const response = await fetch(video.url);
+        
+        if (!response.ok) {
+          console.error(`❌ [${projectId}] Falha: ${video.filename} (${response.status})`);
+          failed++;
+          continue;
+        }
+
+        const buffer = await response.buffer();
+        zip.file(video.filename, buffer);
+        processed++;
+        
+        console.log(`✅ [${projectId}] ${processed}/${videos.length}`);
+        
+        // Pausa a cada 10 vídeos para liberar memória
+        if (i < videos.length - 1 && (i + 1) % 10 === 0) {
+          await new Promise(resolve => setTimeout(resolve, 200));
+          if (global.gc) global.gc();
+        }
+        
+      } catch (err) {
+        console.error(`❌ [${projectId}] Erro: ${video.filename}`, err.message);
+        failed++;
+      }
+    }
+
+    if (processed === 0) {
+      return res.status(500).json({ error: 'Nenhum vídeo processado com sucesso' });
+    }
+
+    console.log(`🗜️ [${projectId}] Gerando arquivo ZIP com ${processed} vídeos (${failed} falhas)...`);
+    
+    // Gerar ZIP sem compressão para economizar CPU
+    const zipBuffer = await zip.generateAsync({
+      type: 'nodebuffer',
+      compression: 'STORE',
+      streamFiles: true
+    });
+
+    const zipSizeMB = (zipBuffer.length / 1024 / 1024).toFixed(2);
+    console.log(`📦 [${projectId}] ZIP gerado: ${zipSizeMB} MB`);
+
+    // Retornar ZIP diretamente
+    const timestamp = Date.now();
+    const filename = `${productCode}_videos_${timestamp}.zip`;
+    
+    res.setHeader('Content-Type', 'application/zip');
+    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+    res.setHeader('Content-Length', zipBuffer.length);
+    res.send(zipBuffer);
+
+    console.log(`✅ [${projectId}] ZIP enviado com sucesso: ${filename}`);
+
+  } catch (error) {
+    console.error(`❌ Erro ao gerar ZIP:`, error);
+    res.status(500).json({ error: error.message });
   }
 });
 
