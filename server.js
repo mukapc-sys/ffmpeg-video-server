@@ -8,6 +8,7 @@ const fetch = require("node-fetch");
 const FormData = require("form-data");
 const crypto = require("crypto");
 const JSZip = require("jszip");
+const https = require("https"); // ✅ ESSENCIAL PARA CORRIGIR O ERRO EPROTO DO R2
 
 const execAsync = promisify(exec);
 const app = express();
@@ -584,7 +585,7 @@ app.post("/compress", authenticateApiKey, async (req, res) => {
 });
 
 // ============================================
-// ENDPOINT: GENERATE ZIP (UPLOAD TO R2) - DEFINITIVO E CORRETO
+// ENDPOINT: GENERATE ZIP (UPLOAD TO R2) - FINAL ESTÁVEL (SEM EPROTO)
 // ============================================
 app.post('/generate-zip', authenticateApiKey, async (req, res) => {
   try {
@@ -648,7 +649,6 @@ app.post('/generate-zip', authenticateApiKey, async (req, res) => {
     const r2Endpoint = `https://${r2Config.accountId}.r2.cloudflarestorage.com`;
     const region = "auto";
 
-    // ✅ USO CORRETO DA FUNÇÃO ASSINADA
     const signedUrl = await generateR2SignedUrl(
       r2Endpoint,
       r2Config.bucketName,
@@ -659,13 +659,19 @@ app.post('/generate-zip', authenticateApiKey, async (req, res) => {
       "PUT"
     );
 
+    const httpsAgent = new (require('https').Agent)({
+      keepAlive: true,
+      rejectUnauthorized: false
+    });
+
     const uploadResponse = await fetch(signedUrl, {
       method: "PUT",
       headers: {
         "Content-Type": "application/zip",
         "Content-Length": zipBuffer.length.toString()
       },
-      body: zipBuffer
+      body: zipBuffer,
+      agent: httpsAgent
     });
 
     if (!uploadResponse.ok) {
