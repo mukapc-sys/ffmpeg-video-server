@@ -584,46 +584,44 @@ app.post("/compress", authenticateApiKey, async (req, res) => {
 });
 
 // ============================================
-// ENDPOINT: GENERATE ZIP (OTIMIZADO COM STREAMING)
+// ENDPOINT: GENERATE ZIP (UPLOAD TO R2)
 // ============================================
 app.post('/generate-zip', authenticateApiKey, async (req, res) => {
   try {
-    const { videos, projectId, userId, productCode } = req.body;
+    const { videos, projectId, userId, productCode, r2Config } = req.body;
     
     if (!videos || !Array.isArray(videos) || videos.length === 0) {
       return res.status(400).json({ error: 'Videos array is required' });
     }
 
-    console.log(`📦 [${projectId}] Gerando ZIP para ${videos.length} vídeos (STREAMING)`);
+    if (!r2Config || !r2Config.accountId || !r2Config.accessKeyId || !r2Config.secretAccessKey || !r2Config.bucketName) {
+      return res.status(400).json({ error: 'R2 config is required' });
+    }
+
+    console.log(`📦 [${projectId}] Gerando ZIP para ${videos.length} vídeos`);
 
     const zip = new JSZip();
     let processed = 0;
     let failed = 0;
 
-    // Processar vídeos em lotes de 5 para evitar sobrecarga de memória
-    const BATCH_SIZE = 5;
+    // Processar vídeos em lotes pequenos (3 por vez)
+    const BATCH_SIZE = 3;
     for (let batchStart = 0; batchStart < videos.length; batchStart += BATCH_SIZE) {
       const batchEnd = Math.min(batchStart + BATCH_SIZE, videos.length);
       const batch = videos.slice(batchStart, batchEnd);
       
-      console.log(`📦 [${projectId}] Processando lote ${Math.floor(batchStart/BATCH_SIZE) + 1}/${Math.ceil(videos.length/BATCH_SIZE)} (${batch.length} vídeos)`);
+      console.log(`📦 [${projectId}] Lote ${Math.floor(batchStart/BATCH_SIZE) + 1}/${Math.ceil(videos.length/BATCH_SIZE)}`);
       
-      // Processar lote em paralelo
       const batchPromises = batch.map(async (video, idx) => {
         const globalIdx = batchStart + idx;
         try {
-          console.log(`📥 [${projectId}] ${globalIdx + 1}/${videos.length}: ${video.filename}`);
-          
-          const response = await fetch(video.url, {
-            timeout: 120000 // 2 minutos timeout
-          });
+          const response = await fetch(video.url, { timeout: 90000 });
           
           if (!response.ok) {
-            console.error(`❌ [${projectId}] Falha HTTP ${response.status}: ${video.filename}`);
+            console.error(`❌ [${projectId}] HTTP ${response.status}: ${video.filename}`);
             return { success: false };
           }
 
-          // Usar streaming para não carregar tudo na memória de uma vez
           const chunks = [];
           for await (const chunk of response.body) {
             chunks.push(chunk);
@@ -631,12 +629,12 @@ app.post('/generate-zip', authenticateApiKey, async (req, res) => {
           const buffer = Buffer.concat(chunks);
           
           zip.file(video.filename, buffer);
-          console.log(`✅ [${projectId}] ${globalIdx + 1}/${videos.length} adicionado (${(buffer.length/1024/1024).toFixed(2)} MB)`);
+          console.log(`✅ [${projectId}] ${globalIdx + 1}/${videos.length}: ${video.filename}`);
           
           return { success: true };
           
         } catch (err) {
-          console.error(`❌ [${projectId}] Erro em ${video.filename}:`, err.message);
+          console.error(`❌ [${projectId}] ${video.filename}:`, err.message);
           return { success: false };
         }
       });
@@ -645,42 +643,70 @@ app.post('/generate-zip', authenticateApiKey, async (req, res) => {
       processed += results.filter(r => r.success).length;
       failed += results.filter(r => !r.success).length;
       
-      // Pequena pausa entre lotes para liberar event loop
       if (batchEnd < videos.length) {
         await new Promise(resolve => setTimeout(resolve, 100));
       }
     }
 
     if (processed === 0) {
-      return res.status(500).json({ error: 'Nenhum vídeo processado com sucesso' });
+      return res.status(500).json({ error: 'Nenhum vídeo processado' });
     }
 
-    console.log(`🗜️ [${projectId}] Gerando arquivo ZIP com ${processed} vídeos (${failed} falhas)...`);
+    console.log(`🗜️ [${projectId}] Gerando ZIP com ${processed} vídeos...`);
     
-    // Gerar ZIP sem compressão (STORE = copia direto, muito mais rápido)
     const zipBuffer = await zip.generateAsync({
       type: 'nodebuffer',
-      compression: 'STORE', // Sem compressão = 10x mais rápido
+      compression: 'STORE',
       streamFiles: true,
       compressionOptions: { level: 0 }
     });
 
     const zipSizeMB = (zipBuffer.length / 1024 / 1024).toFixed(2);
-    console.log(`📦 [${projectId}] ZIP gerado: ${zipSizeMB} MB (${processed} vídeos)`);
+    console.log(`📦 [${projectId}] ZIP: ${zipSizeMB} MB`);
 
-    // Retornar ZIP diretamente
+    // Upload para R2
     const timestamp = Date.now();
     const filename = `${productCode}_videos_${timestamp}.zip`;
+    const r2Path = `zips/${projectId}/${filename}`;
     
-    res.setHeader('Content-Type', 'application/zip');
-    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
-    res.setHeader('Content-Length', zipBuffer.length);
-    res.send(zipBuffer);
+    console.log(`📤 [${projectId}] Upload para R2: ${r2Path}`);
+    
+    const r2Url = `https://${r2Config.accountId}.r2.cloudflarestorage.com/${r2Config.bucketName}/${r2Path}`;
+    const signedUrl = await generateR2SignedUrl(
+      'PUT',
+      r2Config.bucketName,
+      r2Path,
+      r2Config.accountId,
+      r2Config.accessKeyId,
+      r2Config.secretAccessKey
+    );
 
-    console.log(`✅ [${projectId}] ZIP enviado: ${filename}`);
+    const uploadResponse = await fetch(signedUrl, {
+      method: 'PUT',
+      body: zipBuffer,
+      headers: {
+        'Content-Type': 'application/zip',
+        'Content-Length': zipBuffer.length.toString()
+      }
+    });
+
+    if (!uploadResponse.ok) {
+      throw new Error(`R2 upload falhou: ${uploadResponse.status}`);
+    }
+
+    console.log(`✅ [${projectId}] ZIP enviado para R2`);
+
+    res.json({
+      success: true,
+      r2Path: `r2://${r2Config.bucketName}/${r2Path}`,
+      publicUrl: r2Url,
+      size: zipBuffer.length,
+      videosProcessed: processed,
+      videosFailed: failed
+    });
 
   } catch (error) {
-    console.error(`❌ [${projectId}] Erro ao gerar ZIP:`, error);
+    console.error(`❌ [${projectId}] Erro:`, error);
     res.status(500).json({ error: error.message });
   }
 });
