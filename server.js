@@ -7,7 +7,7 @@ const path = require("path");
 const fetch = require("node-fetch");
 const FormData = require("form-data");
 const crypto = require("crypto");
-const JSZip = require("jszip");
+const archiver = require("archiver");
 
 const execAsync = promisify(exec);
 const app = express();
@@ -584,111 +584,97 @@ app.post("/compress", authenticateApiKey, async (req, res) => {
 });
 
 // ============================================
-// ENDPOINT: GENERATE ZIP (UPLOAD TO R2)
+// ENDPOINT: GENERATE ZIP (STREAM REAL - NÃO CRASHA)
 // ============================================
-app.post('/generate-zip', authenticateApiKey, async (req, res) => {
-  try {
-    const { videos, projectId, userId, productCode, r2Config } = req.body;
-    
-    if (!videos || !Array.isArray(videos) || videos.length === 0) {
-      return res.status(400).json({ error: 'Videos array is required' });
-    }
 
-    if (!r2Config || !r2Config.accountId || !r2Config.accessKeyId || !r2Config.secretAccessKey || !r2Config.bucketName) {
-      return res.status(400).json({ error: 'R2 config is required' });
+const archiver = require("archiver");
+const fsSync = require("fs");
+
+app.post('/generate-zip', authenticateApiKey, async (req, res) => {
+  const { videos, projectId, productCode, r2Config } = req.body;
+
+  try {
+    if (!videos || !videos.length) {
+      return res.status(400).json({ error: "Videos são obrigatórios" });
     }
 
     console.log(`📦 [${projectId}] Gerando ZIP para ${videos.length} vídeos`);
 
-    const zip = new JSZip();
+    const zipName = `${productCode}_videos_${Date.now()}.zip`;
+    const localZipPath = `/tmp/${zipName}`;
+
+    const output = fsSync.createWriteStream(localZipPath);
+    const archive = archiver("zip", { zlib: { level: 9 } });
+
+    archive.pipe(output);
+
     let processed = 0;
-    let failed = 0;
 
-    // Processar vídeos em lotes pequenos (3 por vez)
-    const BATCH_SIZE = 3;
-    for (let batchStart = 0; batchStart < videos.length; batchStart += BATCH_SIZE) {
-      const batchEnd = Math.min(batchStart + BATCH_SIZE, videos.length);
-      const batch = videos.slice(batchStart, batchEnd);
-      
-      console.log(`📦 [${projectId}] Lote ${Math.floor(batchStart/BATCH_SIZE) + 1}/${Math.ceil(videos.length/BATCH_SIZE)}`);
-      
-      const batchPromises = batch.map(async (video, idx) => {
-        const globalIdx = batchStart + idx;
-        try {
-          const response = await fetch(video.url, { timeout: 90000 });
-          
-          if (!response.ok) {
-            console.error(`❌ [${projectId}] HTTP ${response.status}: ${video.filename}`);
-            return { success: false };
-          }
+    for (const video of videos) {
+      console.log(`➕ Adicionando: ${video.filename}`);
 
-          const chunks = [];
-          for await (const chunk of response.body) {
-            chunks.push(chunk);
-          }
-          const buffer = Buffer.concat(chunks);
-          
-          zip.file(video.filename, buffer);
-          console.log(`✅ [${projectId}] ${globalIdx + 1}/${videos.length}: ${video.filename}`);
-          
-          return { success: true };
-          
-        } catch (err) {
-          console.error(`❌ [${projectId}] ${video.filename}:`, err.message);
-          return { success: false };
-        }
-      });
-      
-      const results = await Promise.all(batchPromises);
-      processed += results.filter(r => r.success).length;
-      failed += results.filter(r => !r.success).length;
-      
-      if (batchEnd < videos.length) {
-        await new Promise(resolve => setTimeout(resolve, 100));
+      const response = await fetch(video.url);
+
+      if (!response.ok) {
+        console.warn(`⚠️ Falha: ${video.filename}`);
+        continue;
       }
+
+      archive.append(response.body, { name: video.filename });
+      processed++;
     }
 
-    if (processed === 0) {
-      return res.status(500).json({ error: 'Nenhum vídeo processado' });
-    }
+    await archive.finalize();
+    await new Promise(resolve => output.on("close", resolve));
 
-    console.log(`🗜️ [${projectId}] Gerando ZIP com ${processed} vídeos...`);
-    
-    const zipBuffer = await zip.generateAsync({
-      type: 'nodebuffer',
-      compression: 'STORE',
-      streamFiles: true,
-      compressionOptions: { level: 0 }
-    });
+    console.log(`✅ ZIP gerado local: ${localZipPath}`);
 
-    const zipSizeMB = (zipBuffer.length / 1024 / 1024).toFixed(2);
-    console.log(`📦 [${projectId}] ZIP: ${zipSizeMB} MB`);
+    const zipBuffer = await fs.readFile(localZipPath);
 
     // Upload para R2
-    const timestamp = Date.now();
-    const filename = `${productCode}_videos_${timestamp}.zip`;
-    const r2Path = `zips/${projectId}/${filename}`;
-    
-    console.log(`📤 [${projectId}] Upload para R2: ${r2Path}`);
-    
-    const r2Url = `https://${r2Config.accountId}.r2.cloudflarestorage.com/${r2Config.bucketName}/${r2Path}`;
+    const r2Path = `zips/${projectId}/${zipName}`;
+    const r2Endpoint = `https://${r2Config.accountId}.r2.cloudflarestorage.com`;
+
     const signedUrl = await generateR2SignedUrl(
-      'PUT',
+      r2Endpoint,
       r2Config.bucketName,
       r2Path,
-      r2Config.accountId,
       r2Config.accessKeyId,
-      r2Config.secretAccessKey
+      r2Config.secretAccessKey,
+      "auto",
+      "PUT"
     );
 
     const uploadResponse = await fetch(signedUrl, {
-      method: 'PUT',
-      body: zipBuffer,
+      method: "PUT",
       headers: {
-        'Content-Type': 'application/zip',
-        'Content-Length': zipBuffer.length.toString()
-      }
+        "Content-Type": "application/zip",
+        "Content-Length": zipBuffer.length.toString()
+      },
+      body: zipBuffer
     });
+
+    if (!uploadResponse.ok) {
+      throw new Error("Falha no upload ZIP R2");
+    }
+
+    await fs.unlink(localZipPath);
+
+    const publicUrl = `https://${r2Config.accountId}.r2.cloudflarestorage.com/${r2Config.bucketName}/${r2Path}`;
+
+    console.log(`✅ ZIP DISPONÍVEL: ${publicUrl}`);
+
+    res.json({
+      success: true,
+      publicUrl,
+      videosProcessados: processed
+    });
+
+  } catch (err) {
+    console.error(`❌ ERRO ZIP:`, err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
 
     if (!uploadResponse.ok) {
       throw new Error(`R2 upload falhou: ${uploadResponse.status}`);
