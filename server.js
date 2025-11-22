@@ -584,7 +584,7 @@ app.post("/compress", authenticateApiKey, async (req, res) => {
 });
 
 // ============================================
-// ENDPOINT: GENERATE ZIP (STREAM REAL + R2) - CORRIGIDO E ESTÁVEL
+// ENDPOINT: GENERATE ZIP (RAILWAY SAFE + R2)
 // ============================================
 const archiver = require("archiver");
 const { PassThrough } = require("stream");
@@ -601,11 +601,10 @@ app.post("/generate-zip", authenticateApiKey, async (req, res) => {
       return res.status(400).json({ error: "R2 config is required" });
     }
 
-    console.log(`📦 [${projectId}] Gerando ZIP REAL para ${videos.length} vídeos`);
+    console.log(`📦 [${projectId}] Gerando ZIP SEGURO para ${videos.length} vídeos`);
 
     const zipFilename = `${productCode}_videos_${Date.now()}.zip`;
     const r2Path = `zips/${projectId}/${zipFilename}`;
-
     const r2Endpoint = `https://${r2Config.accountId}.r2.cloudflarestorage.com`;
 
     const signedUrl = await generateR2SignedUrl(
@@ -618,28 +617,31 @@ app.post("/generate-zip", authenticateApiKey, async (req, res) => {
       "PUT"
     );
 
-    console.log(`📤 [${projectId}] Stream ZIP direto para R2`);
+    console.log(`📤 Enviando ZIP para R2 via stream...`);
 
-    // Stream que vai direto para o R2
     const zipStream = new PassThrough();
 
     const uploadPromise = fetch(signedUrl, {
       method: "PUT",
-      headers: {
-        "Content-Type": "application/zip",
-      },
+      headers: { "Content-Type": "application/zip" },
       body: zipStream
     });
 
-    const archive = archiver("zip", { zlib: { level: 9 } });
+    const archive = archiver("zip", {
+      zlib: { level: 9 },
+      highWaterMark: 1024 * 1024 * 8
+    });
+
     archive.pipe(zipStream);
 
     let processed = 0;
     let failed = 0;
 
     for (const video of videos) {
+      const tmpFilePath = `/tmp/${video.filename}`;
+
       try {
-        console.log(`📥 [${projectId}] Adicionando: ${video.filename}`);
+        console.log(`📥 Baixando: ${video.filename}`);
 
         const response = await fetch(video.url, { timeout: 300000 });
 
@@ -649,11 +651,17 @@ app.post("/generate-zip", authenticateApiKey, async (req, res) => {
           continue;
         }
 
-        archive.append(response.body, { name: video.filename });
+        const buffer = await response.buffer();
+        await fs.writeFile(tmpFilePath, buffer);
+
+        archive.file(tmpFilePath, { name: video.filename });
+
         processed++;
 
+        await fs.unlink(tmpFilePath);
+
       } catch (err) {
-        console.error(`❌ Erro ao adicionar ${video.filename}:`, err.message);
+        console.error(`❌ Erro: ${video.filename}`, err.message);
         failed++;
       }
     }
@@ -669,7 +677,7 @@ app.post("/generate-zip", authenticateApiKey, async (req, res) => {
 
     const publicUrl = `https://${r2Config.accountId}.r2.cloudflarestorage.com/${r2Config.bucketName}/${r2Path}`;
 
-    console.log(`✅ ZIP enviado com sucesso: ${publicUrl}`);
+    console.log(`✅ ZIP gerado e enviado com sucesso`);
 
     return res.json({
       success: true,
@@ -679,8 +687,8 @@ app.post("/generate-zip", authenticateApiKey, async (req, res) => {
     });
 
   } catch (error) {
-    console.error(`❌ [${req.body?.projectId}] Erro ZIP:`, error);
-    res.status(500).json({ error: error.message });
+    console.error(`❌ Erro ZIP:`, error);
+    return res.status(500).json({ error: error.message });
   }
 });
 
