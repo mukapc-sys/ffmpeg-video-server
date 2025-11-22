@@ -584,46 +584,67 @@ app.post("/compress", authenticateApiKey, async (req, res) => {
 });
 
 // ============================================
-// ENDPOINT: GENERATE ZIP (STREAM + R2) - ESTÁVEL PARA 100+ VÍDEOS
+// ENDPOINT: GENERATE ZIP (STREAM REAL + R2) - CORRIGIDO E ESTÁVEL
 // ============================================
 const archiver = require("archiver");
+const { PassThrough } = require("stream");
 
-app.post('/generate-zip', authenticateApiKey, async (req, res) => {
+app.post("/generate-zip", authenticateApiKey, async (req, res) => {
   try {
     const { videos, projectId, productCode, r2Config } = req.body;
 
     if (!videos || !Array.isArray(videos) || videos.length === 0) {
-      return res.status(400).json({ error: 'Videos array is required' });
+      return res.status(400).json({ error: "Videos array is required" });
     }
 
     if (!r2Config || !r2Config.accountId || !r2Config.accessKeyId || !r2Config.secretAccessKey || !r2Config.bucketName) {
-      return res.status(400).json({ error: 'R2 config is required' });
+      return res.status(400).json({ error: "R2 config is required" });
     }
 
-    console.log(`📦 [${projectId}] Gerando ZIP (STREAM) para ${videos.length} vídeos`);
+    console.log(`📦 [${projectId}] Gerando ZIP REAL para ${videos.length} vídeos`);
 
     const zipFilename = `${productCode}_videos_${Date.now()}.zip`;
-    const tmpZipPath = `/tmp/${zipFilename}`;
+    const r2Path = `zips/${projectId}/${zipFilename}`;
 
-    // ============================
-    // CRIAR ZIP EM DISCO (STREAM)
-    // ============================
-    const output = require('fs').createWriteStream(tmpZipPath);
-    const archive = archiver('zip', { zlib: { level: 9 } });
+    const r2Endpoint = `https://${r2Config.accountId}.r2.cloudflarestorage.com`;
 
-    archive.pipe(output);
+    const signedUrl = await generateR2SignedUrl(
+      r2Endpoint,
+      r2Config.bucketName,
+      r2Path,
+      r2Config.accessKeyId,
+      r2Config.secretAccessKey,
+      "auto",
+      "PUT"
+    );
+
+    console.log(`📤 [${projectId}] Stream ZIP direto para R2`);
+
+    // Stream que vai direto para o R2
+    const zipStream = new PassThrough();
+
+    const uploadPromise = fetch(signedUrl, {
+      method: "PUT",
+      headers: {
+        "Content-Type": "application/zip",
+      },
+      body: zipStream
+    });
+
+    const archive = archiver("zip", { zlib: { level: 9 } });
+    archive.pipe(zipStream);
 
     let processed = 0;
     let failed = 0;
 
     for (const video of videos) {
       try {
-        console.log(`📥 [${projectId}] Adicionando ao ZIP: ${video.filename}`);
+        console.log(`📥 [${projectId}] Adicionando: ${video.filename}`);
 
         const response = await fetch(video.url, { timeout: 300000 });
 
         if (!response.ok) {
-          console.error(`❌ Falha HTTP ${response.status}: ${video.filename}`);
+          console.error(`❌ HTTP ${response.status}: ${video.filename}`);
           failed++;
           continue;
         }
@@ -639,51 +660,16 @@ app.post('/generate-zip', authenticateApiKey, async (req, res) => {
 
     await archive.finalize();
 
-    // Aguarda escrita completa
-    await new Promise(resolve => output.on('close', resolve));
-
-    console.log(`✅ ZIP criado localmente: ${tmpZipPath}`);
-
-    // ============================
-    // UPLOAD PARA R2
-    // ============================
-    const zipBuffer = await fs.readFile(tmpZipPath);
-    const r2Path = `zips/${projectId}/${zipFilename}`;
-
-    const r2Endpoint = `https://${r2Config.accountId}.r2.cloudflarestorage.com`;
-
-    const signedUrl = await generateR2SignedUrl(
-      r2Endpoint,
-      r2Config.bucketName,
-      r2Path,
-      r2Config.accessKeyId,
-      r2Config.secretAccessKey,
-      "auto",
-      "PUT"
-    );
-
-    console.log(`📤 [${projectId}] Enviando ZIP para R2...`);
-
-    const uploadResponse = await fetch(signedUrl, {
-      method: "PUT",
-      headers: {
-        "Content-Type": "application/zip",
-        "Content-Length": zipBuffer.length.toString()
-      },
-      body: zipBuffer
-    });
+    const uploadResponse = await uploadPromise;
 
     if (!uploadResponse.ok) {
       const txt = await uploadResponse.text();
       throw new Error(`R2 upload failed: ${uploadResponse.status} - ${txt}`);
     }
 
-    // Remove arquivo temporário
-    await fs.unlink(tmpZipPath);
-
     const publicUrl = `https://${r2Config.accountId}.r2.cloudflarestorage.com/${r2Config.bucketName}/${r2Path}`;
 
-    console.log(`✅ ZIP disponível em: ${publicUrl}`);
+    console.log(`✅ ZIP enviado com sucesso: ${publicUrl}`);
 
     return res.json({
       success: true,
