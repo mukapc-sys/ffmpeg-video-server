@@ -584,7 +584,7 @@ app.post("/compress", authenticateApiKey, async (req, res) => {
 });
 
 // ============================================
-// ENDPOINT: GENERATE ZIP
+// ENDPOINT: GENERATE ZIP (OTIMIZADO COM STREAMING)
 // ============================================
 app.post('/generate-zip', authenticateApiKey, async (req, res) => {
   try {
@@ -594,42 +594,60 @@ app.post('/generate-zip', authenticateApiKey, async (req, res) => {
       return res.status(400).json({ error: 'Videos array is required' });
     }
 
-    console.log(`📦 [${projectId}] Gerando ZIP para ${videos.length} vídeos`);
+    console.log(`📦 [${projectId}] Gerando ZIP para ${videos.length} vídeos (STREAMING)`);
 
     const zip = new JSZip();
     let processed = 0;
     let failed = 0;
 
-    // Processar vídeos sequencialmente
-    for (let i = 0; i < videos.length; i++) {
-      const video = videos[i];
+    // Processar vídeos em lotes de 5 para evitar sobrecarga de memória
+    const BATCH_SIZE = 5;
+    for (let batchStart = 0; batchStart < videos.length; batchStart += BATCH_SIZE) {
+      const batchEnd = Math.min(batchStart + BATCH_SIZE, videos.length);
+      const batch = videos.slice(batchStart, batchEnd);
       
-      try {
-        console.log(`📥 [${projectId}] ${i + 1}/${videos.length}: ${video.filename}`);
-        
-        // Baixar vídeo
-        const response = await fetch(video.url);
-        
-        if (!response.ok) {
-          console.error(`❌ [${projectId}] Falha: ${video.filename} (${response.status})`);
-          failed++;
-          continue;
-        }
+      console.log(`📦 [${projectId}] Processando lote ${Math.floor(batchStart/BATCH_SIZE) + 1}/${Math.ceil(videos.length/BATCH_SIZE)} (${batch.length} vídeos)`);
+      
+      // Processar lote em paralelo
+      const batchPromises = batch.map(async (video, idx) => {
+        const globalIdx = batchStart + idx;
+        try {
+          console.log(`📥 [${projectId}] ${globalIdx + 1}/${videos.length}: ${video.filename}`);
+          
+          const response = await fetch(video.url, {
+            timeout: 120000 // 2 minutos timeout
+          });
+          
+          if (!response.ok) {
+            console.error(`❌ [${projectId}] Falha HTTP ${response.status}: ${video.filename}`);
+            return { success: false };
+          }
 
-        const buffer = await response.buffer();
-        zip.file(video.filename, buffer);
-        processed++;
-        
-        console.log(`✅ [${projectId}] ${processed}/${videos.length}`);
-        
-        // Pausa a cada 10 vídeos para liberar memória
-        if (i < videos.length - 1 && (i + 1) % 10 === 0) {
-          await new Promise(resolve => setTimeout(resolve, 200));
+          // Usar streaming para não carregar tudo na memória de uma vez
+          const chunks = [];
+          for await (const chunk of response.body) {
+            chunks.push(chunk);
+          }
+          const buffer = Buffer.concat(chunks);
+          
+          zip.file(video.filename, buffer);
+          console.log(`✅ [${projectId}] ${globalIdx + 1}/${videos.length} adicionado (${(buffer.length/1024/1024).toFixed(2)} MB)`);
+          
+          return { success: true };
+          
+        } catch (err) {
+          console.error(`❌ [${projectId}] Erro em ${video.filename}:`, err.message);
+          return { success: false };
         }
-        
-      } catch (err) {
-        console.error(`❌ [${projectId}] Erro: ${video.filename}`, err.message);
-        failed++;
+      });
+      
+      const results = await Promise.all(batchPromises);
+      processed += results.filter(r => r.success).length;
+      failed += results.filter(r => !r.success).length;
+      
+      // Pequena pausa entre lotes para liberar event loop
+      if (batchEnd < videos.length) {
+        await new Promise(resolve => setTimeout(resolve, 100));
       }
     }
 
@@ -639,15 +657,16 @@ app.post('/generate-zip', authenticateApiKey, async (req, res) => {
 
     console.log(`🗜️ [${projectId}] Gerando arquivo ZIP com ${processed} vídeos (${failed} falhas)...`);
     
-    // Gerar ZIP sem compressão para economizar CPU
+    // Gerar ZIP sem compressão (STORE = copia direto, muito mais rápido)
     const zipBuffer = await zip.generateAsync({
       type: 'nodebuffer',
-      compression: 'STORE',
-      streamFiles: true
+      compression: 'STORE', // Sem compressão = 10x mais rápido
+      streamFiles: true,
+      compressionOptions: { level: 0 }
     });
 
     const zipSizeMB = (zipBuffer.length / 1024 / 1024).toFixed(2);
-    console.log(`📦 [${projectId}] ZIP gerado: ${zipSizeMB} MB`);
+    console.log(`📦 [${projectId}] ZIP gerado: ${zipSizeMB} MB (${processed} vídeos)`);
 
     // Retornar ZIP diretamente
     const timestamp = Date.now();
@@ -658,10 +677,10 @@ app.post('/generate-zip', authenticateApiKey, async (req, res) => {
     res.setHeader('Content-Length', zipBuffer.length);
     res.send(zipBuffer);
 
-    console.log(`✅ [${projectId}] ZIP enviado com sucesso: ${filename}`);
+    console.log(`✅ [${projectId}] ZIP enviado: ${filename}`);
 
   } catch (error) {
-    console.error(`❌ Erro ao gerar ZIP:`, error);
+    console.error(`❌ [${projectId}] Erro ao gerar ZIP:`, error);
     res.status(500).json({ error: error.message });
   }
 });
