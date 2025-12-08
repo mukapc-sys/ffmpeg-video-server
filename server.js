@@ -1,13 +1,15 @@
-// === server.js === (arquivo completo, com correções de áudio e upload para R2)
+// === server.js === (arquivo completo com streaming otimizado para baixo consumo de RAM)
 const express = require("express");
 const { exec } = require("child_process");
 const { promisify } = require("util");
 const fs = require("fs").promises;
+const fsSync = require("fs");
 const path = require("path");
 const fetch = require("node-fetch");
-const FormData = require("form-data");
 const crypto = require("crypto");
-const JSZip = require("jszip");
+const https = require("https");
+const http = require("http");
+const archiver = require("archiver");
 
 const execAsync = promisify(exec);
 const app = express();
@@ -37,14 +39,14 @@ const authenticateApiKey = (req, res, next) => {
 
 // Health check (public endpoint)
 app.get("/health", (req, res) => {
-  const fsLocal = require("fs");
-  const version = fsLocal.existsSync("./VERSION") ? fsLocal.readFileSync("./VERSION", "utf8").trim() : "unknown";
+  const version = fsSync.existsSync("./VERSION") ? fsSync.readFileSync("./VERSION", "utf8").trim() : "unknown";
 
   res.json({
     status: "ok",
     version: version,
     hasAudioFix: version.includes("audio-sync-fix"),
     timestamp: new Date().toISOString(),
+    optimizations: "streaming-enabled"
   });
 });
 
@@ -58,8 +60,10 @@ app.get("/diagnostics", async (req, res) => {
         used: (process.memoryUsage().heapUsed / 1024 / 1024).toFixed(2) + " MB",
         total: (process.memoryUsage().heapTotal / 1024 / 1024).toFixed(2) + " MB",
         external: (process.memoryUsage().external / 1024 / 1024).toFixed(2) + " MB",
+        rss: (process.memoryUsage().rss / 1024 / 1024).toFixed(2) + " MB",
       },
       uptime: (process.uptime() / 60).toFixed(2) + " minutes",
+      optimizations: "streaming-enabled"
     };
 
     // Check FFmpeg availability
@@ -97,6 +101,140 @@ app.get("/diagnostics", async (req, res) => {
     res.status(500).json({ error: error.message });
   }
 });
+
+// ============================================
+// HELPER: Download via streaming (não carrega em RAM)
+// ============================================
+async function downloadToFile(url, outputPath, timeoutMs = 300000) {
+  return new Promise((resolve, reject) => {
+    const parsedUrl = new URL(url);
+    const protocol = parsedUrl.protocol === 'https:' ? https : http;
+    const fileStream = fsSync.createWriteStream(outputPath);
+    
+    const options = {
+      hostname: parsedUrl.hostname,
+      path: parsedUrl.pathname + parsedUrl.search,
+      method: 'GET',
+      timeout: timeoutMs,
+      rejectUnauthorized: false,
+      requestCert: false,
+      agent: false,
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+      }
+    };
+
+    const req = protocol.request(options, (response) => {
+      // Handle redirects
+      if (response.statusCode >= 300 && response.statusCode < 400 && response.headers.location) {
+        fileStream.close();
+        fs.unlink(outputPath).catch(() => {});
+        return downloadToFile(response.headers.location, outputPath, timeoutMs)
+          .then(resolve)
+          .catch(reject);
+      }
+      
+      if (response.statusCode !== 200) {
+        fileStream.close();
+        fs.unlink(outputPath).catch(() => {});
+        return reject(new Error(`HTTP ${response.statusCode}`));
+      }
+      
+      // Check for HTML response (Google Drive blocking)
+      const contentType = response.headers['content-type'] || '';
+      if (contentType.includes('text/html')) {
+        fileStream.close();
+        fs.unlink(outputPath).catch(() => {});
+        return reject(new Error('Received HTML instead of video - link may be blocked'));
+      }
+      
+      // STREAMING: Pipe direto para arquivo (não RAM)
+      response.pipe(fileStream);
+      
+      fileStream.on('finish', () => {
+        fileStream.close();
+        resolve();
+      });
+      
+      fileStream.on('error', (err) => {
+        fileStream.close();
+        fs.unlink(outputPath).catch(() => {});
+        reject(err);
+      });
+    });
+
+    req.on('error', (error) => {
+      fileStream.close();
+      fs.unlink(outputPath).catch(() => {});
+      reject(new Error(`Erro de rede: ${error.message}`));
+    });
+
+    req.on('timeout', () => {
+      req.destroy();
+      fileStream.close();
+      fs.unlink(outputPath).catch(() => {});
+      reject(new Error('Download timeout'));
+    });
+
+    req.end();
+  });
+}
+
+// ============================================
+// HELPER: Upload via streaming para R2
+// ============================================
+async function uploadFileStreamToR2(signedUrl, filePath, contentType = 'video/mp4') {
+  const stats = await fs.stat(filePath);
+  
+  return new Promise((resolve, reject) => {
+    const url = new URL(signedUrl);
+    const fileStream = fsSync.createReadStream(filePath);
+    
+    const options = {
+      method: 'PUT',
+      hostname: url.hostname,
+      path: url.pathname + url.search,
+      headers: {
+        'Content-Type': contentType,
+        'Content-Length': stats.size
+      },
+      timeout: 600000, // 10 minutos
+      rejectUnauthorized: false,
+      requestCert: false,
+      agent: false
+    };
+    
+    const req = https.request(options, (res) => {
+      let data = '';
+      res.on('data', chunk => data += chunk);
+      res.on('end', () => {
+        if (res.statusCode >= 200 && res.statusCode < 300) {
+          resolve(data);
+        } else {
+          reject(new Error(`Upload failed: ${res.statusCode} - ${data}`));
+        }
+      });
+    });
+    
+    req.on('error', (err) => {
+      fileStream.destroy();
+      reject(err);
+    });
+    
+    req.on('timeout', () => {
+      req.destroy();
+      fileStream.destroy();
+      reject(new Error('Upload timeout'));
+    });
+    
+    fileStream.pipe(req);
+    
+    fileStream.on('error', (err) => {
+      req.destroy();
+      reject(err);
+    });
+  });
+}
 
 // ============================================
 // AWS Signature V4 Helper Functions for R2
@@ -159,15 +297,15 @@ async function generateR2SignedUrl(endpoint, bucket, key, accessKeyId, secretAcc
   return url.toString();
 }
 
-// Main concatenation endpoint (protected)
+// ============================================
+// ENDPOINT: /concatenate (STREAMING OTIMIZADO)
+// ============================================
 app.post("/concatenate", authenticateApiKey, async (req, res) => {
   const {
     videoUrls,
     outputFilename,
     projectId,
     format,
-    supabaseUrl,
-    supabaseKey,
     r2AccountId,
     r2AccessKeyId,
     r2SecretAccessKey,
@@ -196,82 +334,54 @@ app.post("/concatenate", authenticateApiKey, async (req, res) => {
     await fs.mkdir(tempDir, { recursive: true });
     console.log(`[${projectId}] Created temp dir: ${tempDir}`);
 
-    // Download all videos
+    // STREAMING: Download all videos direto para arquivo (não RAM)
     const downloadedFiles = [];
     for (let i = 0; i < videoUrls.length; i++) {
       const url = videoUrls[i];
       const filename = `video-${i}.mp4`;
       const filepath = path.join(tempDir, filename);
 
-      console.log(`[${projectId}] 📥 Downloading video ${i + 1}/${videoUrls.length}...`);
-      console.log(`[${projectId}] URL: ${url}`);
+      console.log(`[${projectId}] 📥 Downloading video ${i + 1}/${videoUrls.length} via streaming...`);
 
       const downloadStartTime = Date.now();
 
-      const response = await fetch(url, {
-        redirect: "follow",
-        timeout: 600000, // 10 minutos timeout para arquivos grandes
-        headers: {
-          "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        },
-      });
+      try {
+        await downloadToFile(url, filepath, 600000); // 10 min timeout
+        
+        const downloadTime = ((Date.now() - downloadStartTime) / 1000).toFixed(2);
+        const stats = await fs.stat(filepath);
+        const sizeMB = (stats.size / 1024 / 1024).toFixed(2);
 
-      console.log(`[${projectId}] Response status: ${response.status}`);
-      console.log(`[${projectId}] Content-Type: ${response.headers.get("content-type")}`);
-      console.log(`[${projectId}] Content-Length: ${response.headers.get("content-length")}`);
+        console.log(`[${projectId}] ✅ Downloaded: ${filename} (${sizeMB} MB in ${downloadTime}s)`);
 
-      if (!response.ok) {
-        throw new Error(`Failed to download video ${i + 1}: ${response.status} ${response.statusText}`);
+        if (stats.size > 200 * 1024 * 1024) {
+          console.warn(`[${projectId}] ⚠️ Large file detected (${sizeMB} MB). Processing may take longer.`);
+        }
+
+        downloadedFiles.push(filepath);
+      } catch (downloadError) {
+        console.error(`[${projectId}] ❌ Download failed for video ${i + 1}:`, downloadError.message);
+        throw new Error(`Failed to download video ${i + 1}: ${downloadError.message}`);
       }
-
-      const contentType = response.headers.get("content-type") || "";
-      if (contentType.includes("text/html")) {
-        console.error(`[${projectId}] ⚠️ WARNING: Received HTML instead of video! Google Drive may be blocking.`);
-        const htmlPreview = (await response.text()).substring(0, 500);
-        console.error(`[${projectId}] HTML preview: ${htmlPreview}`);
-        throw new Error(`Google Drive returned HTML instead of video. Link may be private or blocked.`);
-      }
-
-      const buffer = await response.buffer();
-      await fs.writeFile(filepath, buffer);
-
-      const downloadTime = ((Date.now() - downloadStartTime) / 1000).toFixed(2);
-      const stats = await fs.stat(filepath);
-      const sizeMB = (stats.size / 1024 / 1024).toFixed(2);
-
-      console.log(`[${projectId}] ✅ Downloaded: ${filename} (${sizeMB} MB in ${downloadTime}s)`);
-
-      if (stats.size > 200 * 1024 * 1024) {
-        console.warn(`[${projectId}] ⚠️ Large file detected (${sizeMB} MB). Processing may take longer.`);
-      }
-
-      downloadedFiles.push(filepath);
     }
 
     // ============================================
     // CONCATENAÇÃO: Preparar vídeos já normalizados
-    // (Vídeos validados no upload + já normalizados pelo servidor dedicado)
     // ============================================
     console.log(`[${projectId}] 📝 Preparando ${downloadedFiles.length} vídeos normalizados para concatenação...`);
 
-    // Create concat file for FFmpeg using downloaded files (já normalizados)
+    // Create concat file for FFmpeg using downloaded files
     const concatFilePath = path.join(tempDir, "concat.txt");
     const concatContent = downloadedFiles.map((f) => `file '${f}'`).join("\n");
     await fs.writeFile(concatFilePath, concatContent);
     console.log(`[${projectId}] 📝 Created concat file with ${downloadedFiles.length} videos`);
-    console.log(`[${projectId}] Concat content:\n${concatContent}`);
 
     // ============================================
     // CONCATENAÇÃO HÍBRIDA (stream copy → re-encode se falhar)
     // ============================================
     const outputPath = path.join(tempDir, outputFilename);
     console.log(`[${projectId}] 🎬 Concatenando ${downloadedFiles.length} vídeos...`);
-    console.log(`[${projectId}] Output: ${outputPath}`);
 
-    // ESTRATÉGIA: Como os vídeos JÁ foram normalizados (1080x1920, 30fps, H.264)
-    // 1. Tentar stream copy primeiro (RÁPIDO - sem re-encode)
-    // 2. Se falhar, fazer re-encode leve
-    
     let concatSuccess = false;
     let concatTime = 0;
     
@@ -310,29 +420,20 @@ app.post("/concatenate", authenticateApiKey, async (req, res) => {
       
       try {
         const concatStartTime = Date.now();
-        const { stdout, stderr } = await execAsync(reencodeCommand, {
-          timeout: 600000, // 10 min timeout
-        });
+        await execAsync(reencodeCommand, { timeout: 600000 }); // 10 min timeout
 
         concatTime = ((Date.now() - concatStartTime) / 1000).toFixed(2);
         concatSuccess = true;
         console.log(`[${projectId}] ✅ Re-encode completo em ${concatTime}s!`);
-        
-        if (stderr && stderr.includes("Error")) {
-          console.warn(`[${projectId}] FFmpeg warning:`, stderr);
-        }
       } catch (reencodeError) {
         console.error(`[${projectId}] ❌ Re-encode falhou:`, reencodeError.message);
-        if (reencodeError.stderr) {
-          console.error(`[${projectId}] FFmpeg stderr:`, reencodeError.stderr);
-        }
         throw reencodeError;
       }
     }
     
     // Validar output final
     if (!concatSuccess) {
-      throw new Error('Ambas tentativas de concatenação falharam (stream copy e re-encode)');
+      throw new Error('Ambas tentativas de concatenação falharam');
     }
     
     const outputStats = await fs.stat(outputPath);
@@ -343,13 +444,11 @@ app.post("/concatenate", authenticateApiKey, async (req, res) => {
       throw new Error(`Output video muito pequeno (${outputStats.size} bytes)`);
     }
 
-    // Upload to Cloudflare R2
-    console.log(`[${projectId}] Uploading to R2...`);
-    const fileBuffer = await fs.readFile(outputPath);
+    // STREAMING: Upload to Cloudflare R2 via stream (não carregar em RAM)
+    console.log(`[${projectId}] 📤 Uploading to R2 via streaming...`);
 
     const storagePath = req.body.storagePath || `${projectId}/${outputFilename}`;
 
-    // R2 credentials should come from request payload (passed from edge function)
     if (!r2AccountId || !r2AccessKeyId || !r2SecretAccessKey) {
       throw new Error("R2 credentials not provided in request");
     }
@@ -360,7 +459,6 @@ app.post("/concatenate", authenticateApiKey, async (req, res) => {
 
     console.log(`[${projectId}] Generating signed URL for R2 path: ${storagePath}`);
 
-    // Generate signed URL for upload
     const signedUrl = await generateR2SignedUrl(
       r2Endpoint,
       bucket,
@@ -371,30 +469,19 @@ app.post("/concatenate", authenticateApiKey, async (req, res) => {
       "PUT",
     );
 
-    console.log(`[${projectId}] Uploading to R2 with signed URL...`);
+    console.log(`[${projectId}] Uploading to R2 with streaming...`);
+    
+    // STREAMING: Upload via stream (não fs.readFile)
+    await uploadFileStreamToR2(signedUrl, outputPath, 'video/mp4');
 
-    const uploadResponse = await fetch(signedUrl, {
-      method: "PUT",
-      headers: {
-        "Content-Type": "video/mp4",
-      },
-      body: fileBuffer,
-    });
+    console.log(`[${projectId}] ✅ R2 upload complete!`);
 
-    if (!uploadResponse.ok) {
-      const errorText = await uploadResponse.text();
-      console.error(`[${projectId}] R2 upload failed (${uploadResponse.status}):`, errorText);
-      throw new Error(`R2 upload failed: ${uploadResponse.status} - ${errorText}`);
-    }
-
-    console.log(`[${projectId}] R2 upload complete!`);
-
-    // R2 path will be used to generate signed URLs via edge function
     const publicUrl = `r2://${bucket}/${storagePath}`;
 
+    // Cleanup
     try {
       await fs.rm(tempDir, { recursive: true, force: true });
-      console.log(`[${projectId}] Cleanup complete`);
+      console.log(`[${projectId}] ✅ Cleanup complete`);
     } catch (cleanupError) {
       console.error(`[${projectId}] Cleanup warning:`, cleanupError.message);
     }
@@ -404,7 +491,6 @@ app.post("/concatenate", authenticateApiKey, async (req, res) => {
       console.log(`[${projectId}] Garbage collection triggered`);
     }
 
-    // --- resposta final para o front (URL pública do Supabase)
     return res.json({
       success: true,
       url: publicUrl,
@@ -434,7 +520,9 @@ app.post("/concatenate", authenticateApiKey, async (req, res) => {
   }
 });
 
-// Compression endpoint (protected)
+// ============================================
+// ENDPOINT: /compress (STREAMING OTIMIZADO)
+// ============================================
 app.post("/compress", authenticateApiKey, async (req, res) => {
   const {
     videoUrl,
@@ -447,7 +535,7 @@ app.post("/compress", authenticateApiKey, async (req, res) => {
     audioBitrate = "128k",
     supabaseUrl,
     supabaseKey,
-    outputPath,
+    outputPath: targetOutputPath,
   } = req.body;
 
   console.log(`🗜️ Compression request: CRF=${crf}, preset=${preset}, maxBitrate=${maxBitrate}`);
@@ -456,7 +544,7 @@ app.post("/compress", authenticateApiKey, async (req, res) => {
     return res.status(400).json({ error: "videoUrl is required" });
   }
 
-  const uploadToSupabase = supabaseUrl && supabaseKey && outputPath;
+  const uploadToSupabase = supabaseUrl && supabaseKey && targetOutputPath;
 
   const compressId = `compress-${Date.now()}`;
   const tempDir = path.join("/tmp", compressId);
@@ -466,20 +554,12 @@ app.post("/compress", authenticateApiKey, async (req, res) => {
     console.log(`[${compressId}] Created temp dir: ${tempDir}`);
 
     const inputFile = path.join(tempDir, "input.mp4");
-    console.log(`[${compressId}] 📥 Downloading from: ${videoUrl.substring(0, 80)}...`);
+    console.log(`[${compressId}] 📥 Downloading via streaming...`);
 
     const downloadStartTime = Date.now();
-    const response = await fetch(videoUrl, {
-      redirect: "follow",
-      timeout: 600000,
-    });
-
-    if (!response.ok) {
-      throw new Error(`Download failed: ${response.status} ${response.statusText}`);
-    }
-
-    const buffer = await response.buffer();
-    await fs.writeFile(inputFile, buffer);
+    
+    // STREAMING: Download direto para arquivo (não RAM)
+    await downloadToFile(videoUrl, inputFile, 600000);
 
     const downloadTime = ((Date.now() - downloadStartTime) / 1000).toFixed(2);
     const inputStats = await fs.stat(inputFile);
@@ -490,7 +570,6 @@ app.post("/compress", authenticateApiKey, async (req, res) => {
     console.log(`[${compressId}] 🗜️ Compressing with CRF=${crf}, preset=${preset}...`);
 
     const compressStartTime = Date.now();
-    // removi -af "aresample=async=1:first_pts=0" daqui para evitar pitch changes; uso -ar 48000 -ac 2
     const compressCommand = `ffmpeg -hide_banner -loglevel error -i "${inputFile}" \
       -c:v ${codec} -preset ${preset} -crf ${crf} \
       -maxrate ${maxBitrate} -bufsize ${parseInt(maxBitrate) * 2}M \
@@ -517,24 +596,59 @@ app.post("/compress", authenticateApiKey, async (req, res) => {
     );
 
     if (uploadToSupabase) {
-      console.log(`[${compressId}] 📤 Uploading to Supabase: ${outputPath}`);
+      console.log(`[${compressId}] 📤 Uploading to Supabase via streaming: ${targetOutputPath}`);
 
-      const compressedBuffer = await fs.readFile(outputFile);
-
-      const uploadResponse = await fetch(`${supabaseUrl}/storage/v1/object/videos/${outputPath}`, {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${supabaseKey}`,
-          "Content-Type": "video/mp4",
-          "x-upsert": "false",
-        },
-        body: compressedBuffer,
+      // STREAMING: Upload via stream (não fs.readFile)
+      const supabaseUploadUrl = `${supabaseUrl}/storage/v1/object/videos/${targetOutputPath}`;
+      
+      await new Promise((resolve, reject) => {
+        const stats = fsSync.statSync(outputFile);
+        const fileStream = fsSync.createReadStream(outputFile);
+        const url = new URL(supabaseUploadUrl);
+        
+        const options = {
+          method: 'POST',
+          hostname: url.hostname,
+          path: url.pathname,
+          headers: {
+            'Authorization': `Bearer ${supabaseKey}`,
+            'Content-Type': 'video/mp4',
+            'Content-Length': stats.size,
+            'x-upsert': 'false'
+          },
+          timeout: 600000
+        };
+        
+        const req = https.request(options, (res) => {
+          let data = '';
+          res.on('data', chunk => data += chunk);
+          res.on('end', () => {
+            if (res.statusCode >= 200 && res.statusCode < 300) {
+              resolve(data);
+            } else {
+              reject(new Error(`Supabase upload failed: ${res.statusCode} - ${data}`));
+            }
+          });
+        });
+        
+        req.on('error', (err) => {
+          fileStream.destroy();
+          reject(err);
+        });
+        
+        req.on('timeout', () => {
+          req.destroy();
+          fileStream.destroy();
+          reject(new Error('Upload timeout'));
+        });
+        
+        fileStream.pipe(req);
+        
+        fileStream.on('error', (err) => {
+          req.destroy();
+          reject(err);
+        });
       });
-
-      if (!uploadResponse.ok) {
-        const errorText = await uploadResponse.text();
-        throw new Error(`Supabase upload failed: ${uploadResponse.status} - ${errorText}`);
-      }
 
       console.log(`[${compressId}] ✅ Upload complete`);
 
@@ -543,26 +657,43 @@ app.post("/compress", authenticateApiKey, async (req, res) => {
 
       res.json({
         success: true,
-        outputPath: outputPath,
+        outputPath: targetOutputPath,
         originalSize: inputStats.size,
         compressedSize: outputStats.size,
         compressionRatio: parseFloat(compressionRatio),
         processingTime: parseFloat(compressTime),
       });
     } else {
-      const compressedBuffer = await fs.readFile(outputFile);
-      const compressedBase64 = compressedBuffer.toString("base64");
+      // STREAMING: Retornar via stream (não base64 em RAM)
+      const processingTime = parseFloat(compressTime);
 
-      await fs.rm(tempDir, { recursive: true, force: true });
-      console.log(`[${compressId}] ✅ Cleanup complete`);
+      res.set({
+        'Content-Type': 'video/mp4',
+        'Content-Length': outputStats.size,
+        'X-Processing-Time': processingTime.toString(),
+        'X-Original-Size': inputStats.size.toString(),
+        'X-Compressed-Size': outputStats.size.toString(),
+        'X-Compression-Ratio': compressionRatio
+      });
 
-      res.json({
-        success: true,
-        outputUrl: `data:video/mp4;base64,${compressedBase64}`,
-        originalSize: inputStats.size,
-        compressedSize: outputStats.size,
-        compressionRatio: parseFloat(compressionRatio),
-        processingTime: parseFloat(compressTime),
+      // Cleanup robusto
+      const cleanup = async () => {
+        try {
+          await fs.rm(tempDir, { recursive: true, force: true });
+        } catch (e) {}
+      };
+
+      const fileStream = fsSync.createReadStream(outputFile);
+      fileStream.pipe(res);
+
+      fileStream.on('end', cleanup);
+      fileStream.on('error', async (err) => {
+        console.error(`[${compressId}] ❌ Stream error:`, err);
+        await cleanup();
+      });
+      res.on('close', async () => {
+        fileStream.destroy();
+        await cleanup();
       });
     }
   } catch (error) {
@@ -584,12 +715,15 @@ app.post("/compress", authenticateApiKey, async (req, res) => {
 });
 
 // ============================================
-// ENDPOINT: GENERATE ZIP (UPLOAD TO R2)
+// ENDPOINT: /generate-zip (STREAMING COM ARCHIVER)
 // ============================================
 app.post('/generate-zip', authenticateApiKey, async (req, res) => {
+  const startTime = Date.now();
+  const tempFiles = [];
+  let zipPath = null;
+  const { videos, projectId, userId, productCode, r2Config } = req.body;
+  
   try {
-    const { videos, projectId, userId, productCode, r2Config } = req.body;
-    
     if (!videos || !Array.isArray(videos) || videos.length === 0) {
       return res.status(400).json({ error: 'Videos array is required' });
     }
@@ -598,120 +732,134 @@ app.post('/generate-zip', authenticateApiKey, async (req, res) => {
       return res.status(400).json({ error: 'R2 config is required' });
     }
 
-    console.log(`📦 [${projectId}] Gerando ZIP para ${videos.length} vídeos`);
+    console.log(`📦 [${projectId}] Gerando ZIP para ${videos.length} vídeos (modo streaming)`);
 
-    const zip = new JSZip();
-    let processed = 0;
-    let failed = 0;
-
-    // Processar vídeos em lotes pequenos (3 por vez)
-    const BATCH_SIZE = 3;
-    for (let batchStart = 0; batchStart < videos.length; batchStart += BATCH_SIZE) {
-      const batchEnd = Math.min(batchStart + BATCH_SIZE, videos.length);
-      const batch = videos.slice(batchStart, batchEnd);
-      
-      console.log(`📦 [${projectId}] Lote ${Math.floor(batchStart/BATCH_SIZE) + 1}/${Math.ceil(videos.length/BATCH_SIZE)}`);
+    // FASE 1: Download de vídeos via streaming (não RAM)
+    console.log(`📥 [${projectId}] Fase 1: Download de vídeos via streaming...`);
+    const downloadResults = [];
+    const batchSize = 5;
+    
+    for (let i = 0; i < videos.length; i += batchSize) {
+      const batch = videos.slice(i, i + batchSize);
+      console.log(`📦 [${projectId}] Batch ${Math.floor(i/batchSize) + 1}: vídeos ${i + 1}-${Math.min(i + batchSize, videos.length)}`);
       
       const batchPromises = batch.map(async (video, idx) => {
-        const globalIdx = batchStart + idx;
+        const tempPath = path.join('/tmp', `video_${Date.now()}_${i + idx}.mp4`);
         try {
-          const response = await fetch(video.url, { timeout: 90000 });
-          
-          if (!response.ok) {
-            console.error(`❌ [${projectId}] HTTP ${response.status}: ${video.filename}`);
-            return { success: false };
-          }
-
-          const chunks = [];
-          for await (const chunk of response.body) {
-            chunks.push(chunk);
-          }
-          const buffer = Buffer.concat(chunks);
-          
-          zip.file(video.filename, buffer);
-          console.log(`✅ [${projectId}] ${globalIdx + 1}/${videos.length}: ${video.filename}`);
-          
-          return { success: true };
-          
-        } catch (err) {
-          console.error(`❌ [${projectId}] ${video.filename}:`, err.message);
-          return { success: false };
+          await downloadToFile(video.url, tempPath, 300000);
+          const stats = await fs.stat(tempPath);
+          tempFiles.push(tempPath);
+          console.log(`✅ [${projectId}] ${video.filename} (${(stats.size / 1024 / 1024).toFixed(2)} MB)`);
+          return { success: true, video, tempPath, size: stats.size };
+        } catch (error) {
+          console.error(`❌ [${projectId}] ${video.filename}: ${error.message}`);
+          await fs.unlink(tempPath).catch(() => {});
+          return { success: false, video, error: error.message };
         }
       });
       
       const results = await Promise.all(batchPromises);
-      processed += results.filter(r => r.success).length;
-      failed += results.filter(r => !r.success).length;
-      
-      if (batchEnd < videos.length) {
-        await new Promise(resolve => setTimeout(resolve, 100));
-      }
+      downloadResults.push(...results);
     }
-
-    if (processed === 0) {
-      return res.status(500).json({ error: 'Nenhum vídeo processado' });
-    }
-
-    console.log(`🗜️ [${projectId}] Gerando ZIP com ${processed} vídeos...`);
     
-    const zipBuffer = await zip.generateAsync({
-      type: 'nodebuffer',
-      compression: 'STORE',
-      streamFiles: true,
-      compressionOptions: { level: 0 }
+    const successfulDownloads = downloadResults.filter(r => r.success);
+    const failedDownloads = downloadResults.filter(r => !r.success);
+    
+    if (failedDownloads.length > 0) {
+      console.warn(`⚠️ [${projectId}] ${failedDownloads.length} vídeos falharam`);
+    }
+    
+    if (successfulDownloads.length === 0) {
+      throw new Error('Nenhum vídeo foi baixado com sucesso');
+    }
+
+    console.log(`✅ [${projectId}] ${successfulDownloads.length}/${videos.length} vídeos baixados`);
+
+    // FASE 2: Criar ZIP via streaming com archiver (não JSZip em RAM)
+    console.log(`🔄 [${projectId}] Fase 2: Criando ZIP via streaming...`);
+    
+    zipPath = path.join('/tmp', `zip_${Date.now()}.zip`);
+    const zipOutput = fsSync.createWriteStream(zipPath);
+    const archive = archiver('zip', { store: true }); // Sem compressão = mais rápido
+    
+    archive.pipe(zipOutput);
+    
+    for (const { video, tempPath } of successfulDownloads) {
+      const cleanFilename = video.filename.replace(/[^a-zA-Z0-9._-]/g, '_');
+      archive.file(tempPath, { name: cleanFilename });
+    }
+    
+    await archive.finalize();
+    
+    // Aguardar arquivo ser escrito
+    await new Promise((resolve, reject) => {
+      zipOutput.on('close', resolve);
+      zipOutput.on('error', reject);
     });
+    
+    const zipStats = await fs.stat(zipPath);
+    const zipSizeBytes = zipStats.size;
+    console.log(`✅ [${projectId}] ZIP criado: ${(zipSizeBytes / 1024 / 1024).toFixed(2)} MB`);
 
-    const zipSizeMB = (zipBuffer.length / 1024 / 1024).toFixed(2);
-    console.log(`📦 [${projectId}] ZIP: ${zipSizeMB} MB`);
-
-    // Upload para R2
+    // FASE 3: Upload para R2 via streaming
+    console.log(`☁️ [${projectId}] Fase 3: Upload para R2 via streaming...`);
+    
     const timestamp = Date.now();
     const filename = `${productCode}_videos_${timestamp}.zip`;
     const r2Path = `zips/${projectId}/${filename}`;
     
-    console.log(`📤 [${projectId}] Upload para R2: ${r2Path}`);
-    
-    const r2Url = `https://${r2Config.accountId}.r2.cloudflarestorage.com/${r2Config.bucketName}/${r2Path}`;
+    const r2Endpoint = `https://${r2Config.accountId}.r2.cloudflarestorage.com`;
     const signedUrl = await generateR2SignedUrl(
-      'PUT',
+      r2Endpoint,
       r2Config.bucketName,
       r2Path,
-      r2Config.accountId,
       r2Config.accessKeyId,
-      r2Config.secretAccessKey
+      r2Config.secretAccessKey,
+      'auto',
+      'PUT'
     );
 
-    const uploadResponse = await fetch(signedUrl, {
-      method: 'PUT',
-      body: zipBuffer,
-      headers: {
-        'Content-Type': 'application/zip',
-        'Content-Length': zipBuffer.length.toString()
-      }
-    });
+    await uploadFileStreamToR2(signedUrl, zipPath, 'application/zip');
 
-    if (!uploadResponse.ok) {
-      throw new Error(`R2 upload falhou: ${uploadResponse.status}`);
-    }
-
+    const publicUrl = `https://pub-93cb8cc35ae64cf69f0ea248148ad1b2.r2.dev/${r2Config.bucketName}/${r2Path}`;
     console.log(`✅ [${projectId}] ZIP enviado para R2`);
+
+    // FASE 4: Limpeza
+    console.log(`🧹 [${projectId}] Fase 4: Limpando arquivos temporários...`);
+    for (const tempFile of tempFiles) {
+      await fs.unlink(tempFile).catch(() => {});
+    }
+    await fs.unlink(zipPath).catch(() => {});
+
+    const processingTime = ((Date.now() - startTime) / 1000).toFixed(2);
+    console.log(`🎉 [${projectId}] Concluído em ${processingTime}s`);
 
     res.json({
       success: true,
       r2Path: `r2://${r2Config.bucketName}/${r2Path}`,
-      publicUrl: r2Url,
-      size: zipBuffer.length,
-      videosProcessed: processed,
-      videosFailed: failed
+      publicUrl: publicUrl,
+      size: zipSizeBytes,
+      videosProcessed: successfulDownloads.length,
+      videosFailed: failedDownloads.length,
+      processingTimeSeconds: parseFloat(processingTime)
     });
 
   } catch (error) {
     console.error(`❌ [${projectId}] Erro:`, error);
+    
+    // Limpeza em caso de erro
+    for (const tempFile of tempFiles) {
+      await fs.unlink(tempFile).catch(() => {});
+    }
+    if (zipPath) await fs.unlink(zipPath).catch(() => {});
+    
     res.status(500).json({ error: error.message });
   }
 });
 
-// Limpeza periódica de arquivos temporários (a cada 15 minutos)
+// ============================================
+// LIMPEZA PERIÓDICA DE ARQUIVOS TEMPORÁRIOS
+// ============================================
 setInterval(
   async () => {
     try {
@@ -723,26 +871,27 @@ setInterval(
       const now = Date.now();
 
       for (const file of files) {
-        if (file.startsWith("project-") || file.startsWith("compress-")) {
+        if (file.startsWith("project-") || file.startsWith("compress-") || 
+            file.startsWith("video_") || file.startsWith("zip_")) {
           const filePath = path.join(tmpDir, file);
           try {
             const stats = await fs.stat(filePath);
-            if (now - stats.mtimeMs > 3600000) {
+            if (now - stats.mtimeMs > 3600000) { // 1 hora
               await fs.rm(filePath, { recursive: true, force: true });
               cleanedCount++;
-              console.log(`🗑️  Removed old temp dir: ${file}`);
+              console.log(`🗑️ Removed old temp: ${file}`);
             }
           } catch (err) {}
         }
       }
 
-      console.log(`✅ Cleanup complete: ${cleanedCount} old directories removed`);
+      console.log(`✅ Cleanup complete: ${cleanedCount} old items removed`);
 
       try {
         const { stdout } = await execAsync("pgrep ffmpeg | wc -l");
         const processCount = parseInt(stdout.trim());
         if (processCount > 5) {
-          console.warn(`⚠️  Found ${processCount} FFmpeg processes, killing old ones...`);
+          console.warn(`⚠️ Found ${processCount} FFmpeg processes, killing old ones...`);
           await execAsync('pkill -9 -f "ffmpeg.*project-"');
         }
       } catch (err) {}
@@ -754,14 +903,15 @@ setInterval(
 ); // A cada 15 minutos
 
 const server = app.listen(PORT, () => {
-  console.log(`🎬 FFmpeg Server running on port ${PORT}`);
+  console.log(`🎬 FFmpeg Server v2.0.0 (streaming) running on port ${PORT}`);
   console.log(`✅ Health check: http://localhost:${PORT}/health`);
   console.log(`🧹 Periodic cleanup enabled (every 15 minutes)`);
+  console.log(`⚡ Optimizations: streaming downloads, streaming uploads, archiver ZIP`);
 });
 
-// Configurações de timeout para processamentos longos (compressão iterativa)
-server.timeout = 300000; // 5 minutos - tempo máximo de processamento
-server.keepAliveTimeout = 310000; // 5min + 10s - mantém conexão viva
-server.headersTimeout = 320000; // 5min + 20s - tempo para receber headers
+// Configurações de timeout para processamentos longos
+server.timeout = 300000; // 5 minutos
+server.keepAliveTimeout = 310000;
+server.headersTimeout = 320000;
 
-console.log(`⏱️  Server timeouts: ${server.timeout / 1000}s processing, ${server.keepAliveTimeout / 1000}s keep-alive`);
+console.log(`⏱️ Server timeouts: ${server.timeout / 1000}s processing, ${server.keepAliveTimeout / 1000}s keep-alive`);
