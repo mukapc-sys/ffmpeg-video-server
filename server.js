@@ -424,52 +424,37 @@ app.post("/concatenate", authenticateApiKey, async (req, res) => {
 
         let concatSuccess = false;
         let concatTime = 0;
-        
-        // TENTATIVA 1: Stream Copy (instantâneo)
-        console.log(`[${projectId}] 🚀 Tentando stream copy (rápido)...`);
-        const streamCopyCommand = `ffmpeg -hide_banner -loglevel error -f concat -safe 0 -i "${concatFilePath}" \
-          -c copy \
+
+        // ⚠️ Stream copy desabilitado: causava travamento de imagem na transição
+        // (gancho→corpo) quando timebase/sample-rate dos inputs divergiam minimamente.
+        // Sempre fazer re-encode sincronizado para garantir A/V sync perfeito.
+        console.log(`[${projectId}] 🎯 Using safe concat with perfect A/V sync (forced re-encode)`);
+        const reencodeCommand = `ffmpeg -hide_banner -loglevel error -f concat -safe 0 -i "${concatFilePath}" \
+          -c:v libx264 -preset ultrafast -crf 23 \
+          -c:a aac -b:a 128k -ar 48000 -ac 2 \
+          -af "aresample=async=1:first_pts=0" \
+          -vf "fps=30" \
           -movflags +faststart \
+          -pix_fmt yuv420p \
+          -r 30 \
+          -vsync cfr \
+          -async 1 \
+          -avoid_negative_ts make_zero \
+          -fflags +genpts \
+          -threads 0 \
           -y "${outputPath}"`;
-        
+
         try {
           const concatStartTime = Date.now();
-          await execAsync(streamCopyCommand, { timeout: 120000 }); // 2 min timeout
+          await execAsync(reencodeCommand, { timeout: 600000 }); // 10 min timeout
           concatTime = ((Date.now() - concatStartTime) / 1000).toFixed(2);
           concatSuccess = true;
-          console.log(`[${projectId}] ✅ Stream copy sucesso em ${concatTime}s!`);
-        } catch (streamCopyError) {
-          console.log(`[${projectId}] ⚠️ Stream copy falhou, tentando re-encode...`);
+          console.log(`[${projectId}] ✅ Re-encode sincronizado completo em ${concatTime}s!`);
+        } catch (reencodeError) {
+          console.error(`[${projectId}] ❌ Re-encode falhou:`, reencodeError.message);
+          throw reencodeError;
         }
-        
-        // TENTATIVA 2: Re-encode leve (se stream copy falhou)
-        if (!concatSuccess) {
-          console.log(`[${projectId}] 🔄 Fazendo re-encode com preset ultrafast...`);
-          const reencodeCommand = `ffmpeg -hide_banner -loglevel error -f concat -safe 0 -i "${concatFilePath}" \
-            -c:v libx264 -preset ultrafast -crf 23 \
-            -c:a aac -b:a 128k -ar 44100 -ac 2 \
-            -movflags +faststart \
-            -pix_fmt yuv420p \
-            -r 30 \
-            -vsync cfr \
-            -async 1 \
-            -avoid_negative_ts make_zero \
-            -fflags +genpts \
-            -threads 0 \
-            -y "${outputPath}"`;
-          
-          try {
-            const concatStartTime = Date.now();
-            await execAsync(reencodeCommand, { timeout: 600000 }); // 10 min timeout
 
-            concatTime = ((Date.now() - concatStartTime) / 1000).toFixed(2);
-            concatSuccess = true;
-            console.log(`[${projectId}] ✅ Re-encode completo em ${concatTime}s!`);
-          } catch (reencodeError) {
-            console.error(`[${projectId}] ❌ Re-encode falhou:`, reencodeError.message);
-            throw reencodeError;
-          }
-        }
         
         // Validar output final
         if (!concatSuccess) {
